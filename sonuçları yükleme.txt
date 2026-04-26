@@ -1,0 +1,23 @@
+DATALEAGUE DATATHON: TESLİMAT VE ÇIKTI FORMATLARI 
+Değerli DataLeague Takımları, 24 saatlik maratonunuzda hepinize başarılar diliyoruz!
+
+Süreniz dolduğunda jürinin sizi değerlendirebilmesi için hazırlamanız gereken 3 ana teslimat (çıktı) bulunmaktadır. Çalışmalarınızı bu formatlara göre planlamanız büyük önem taşımaktadır:
+
+1. Çalışan Kaynak Kod (Notebook veya Script)
+
+Format: .ipynb (Jupyter Notebook) dosyası veya GitHub Repo Linki.
+
+Detay: Veri temizliğinden model seçimine kadar tüm adımlarınız temiz bir kodla (mümkünse yorum satırlarıyla) burada olmalıdır.
+
+KRİTİK: Jüri sunumunuz sırasında, size o an vereceği "Gizli Test Metinleri"ni bu kod üzerinden çalıştırıp canlı tahmin (Inference) yapmanızı isteyecektir. Kodunuzun sunum anında anlık çalışabilir durumda olduğundan emin olun!
+
+2. Proje Sunumu (Pitch Deck)
+
+Format: .pdf veya .pptx (PowerPoint).
+
+Detay: Geliştirdiğiniz anomali tespit sistemini, bulduğunuz manipülasyon ağlarını ve veri analiz grafiklerinizi (Manipülasyon Haritası) jüriye anlatacağınız maksimum 5-10 sayfalık sunum dosyası. 
+
+Teslimat Nasıl Yapılacak?
+Yarışmanın bitimine 1 saat kala sizlerle bir Form Linki paylaşılacaktır. Süre dolduğu an (24. saatin sonunda) form otomatik olarak kapanacak ve hiçbir bahane kabul edilmeyecektir. Kodlarınızı ve sunumlarınızı bu süre zarfında forma yüklemeniz gerekmektedir.
+
+Zaman yönetimine dikkat edin. Hepinize kolay gelsin!

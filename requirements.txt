@@ -1,0 +1,8 @@
+pandas
+pyarrow
+jupyter
+ipykernel
+matplotlib
+seaborn
+tldextract
+plotly
