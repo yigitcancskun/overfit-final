@@ -27,6 +27,7 @@ CONFIG = {
         "batch_sqlite_db": "data/fusion_batch_store.sqlite",
         "author_scores_parquet": "data/fusion_author_scores.parquet",
         "scored_messages_parquet": "data/fusion_scored_messages.parquet",
+        "manifest_path": "data/fusion_manifest.json",
     },
     "runtime": {
         "mode": "full",
@@ -85,38 +86,40 @@ CONFIG
 
 NOTEBOOK_CELLS = [
     md_cell(
-        """# Formula Tabanli Robot Skorlama Pipeline
+        """# Fusion Formula Tabanli Robot Skorlama Pipeline
 
-Bu notebook tek teslim akisina gore kuruldu:
+Bu notebook iki ayri calisma modu sunar:
 
-- cleaning
-- sadece formule girecek feature engineering
-- behavioral skor hesaplama
-- hard-bot override
-- inference scaffold
+- `Full Build`: ilk kez SQLite store ve cluster artefact'larini uretir
+- `Rescore From Existing Store`: mevcut `fusion_batch_store.sqlite` korunarak sadece skor katmanini yeniden hesaplar
 
-Semantic katman ilk versiyonda yoktur. Nihai skor `0 -> insan`, `1 -> robot` mantigiyla uretilir.
+Tum gorsellestirme hucreleri oncesinde artefact readiness kontrolu zorunludur. Eski-yeni uyumsuzluklarda notebook sessiz fallback yapmaz; yonlendirici hata uretir.
 """
     ),
     code_cell(CONFIG_CELL),
     code_cell(
-        """import pandas as pd
+        """import matplotlib.pyplot as plt
+import pandas as pd
 import pyarrow.parquet as pq
 
 from formula_scoring_pipeline import (
+    assert_artifacts_ready,
+    load_manifest,
     plot_hourly_distribution,
     plot_hourly_penalty_curve,
     plot_sentiment_theme_distributions,
     prepare_single_message_input,
     run_formula_pipeline_two_pass,
+    run_rescore_from_existing_store,
     score_single_message,
+    validate_scored_outputs,
 )
 """
     ),
     md_cell(
         """## Input Kontrolu
 
-Veri kaynagini, satir sayisini ve mevcut runtime ayarlarini burada kontrol edin.
+Veri kaynagini, satir sayisini ve runtime ayarlarini burada kontrol edin.
 """
     ),
     code_cell(
@@ -130,21 +133,62 @@ print(CONFIG)
 """
     ),
     md_cell(
-        """## Pipeline Calistir
+        """## Full Build
 
-Bu hucre cleaning, feature engineering ve formula scoring akisini birlikte calistirir.
+Ilk kez store olustururken bu hucreyi calistirin. Bu adim `fusion_batch_store.sqlite` dosyasini yeniden kurar.
 """
     ),
     code_cell(
         """result = run_formula_pipeline_two_pass(CONFIG)
 tables = result["tables"]
 
-print("pipeline completed")
-print(f"clean_rows={result['summary']['clean_rows']:,}")
-print(f"technical_duplicates_removed={result['summary']['technical_duplicates_removed']:,}")
-print(f"anonymous_rows={result['summary']['missing_author_rows']:,}")
+print("full build completed")
 print(result["paths"])
 """
+    ),
+    md_cell(
+        """## Rescore From Existing Store
+
+Weight veya scoring threshold degistiginde bu hucreyi calistirin. Bu adim SQLite store'u yeniden olusturmaz; yalnizca `author_scores.parquet` ve `scored_messages.parquet` dosyalarini overwrite eder.
+"""
+    ),
+    code_cell(
+        """result = run_rescore_from_existing_store(CONFIG)
+tables = result["tables"]
+
+print("rescore completed")
+print(result["paths"])
+"""
+    ),
+    md_cell(
+        """## Artefact Readiness Check
+
+Bu hucre tum gorsellestirme ve tablo hucrelerinden once calismalidir. Burasi manifest, SQLite store ve scored outputs uyumlulugunu siki sekilde dogrular.
+"""
+    ),
+    code_cell(
+        """result = assert_artifacts_ready(result, CONFIG)
+tables = result["tables"]
+manifest = result["manifest"]
+
+print("artifacts ready")
+print({
+    "pipeline_version": manifest["pipeline_version"],
+    "store_schema_version": manifest["store_schema_version"],
+    "score_schema_version": manifest["score_schema_version"],
+    "created_at": manifest["created_at"],
+    "last_rescore_at": manifest.get("last_rescore_at"),
+})
+"""
+    ),
+    md_cell(
+        """## Manifest Ozeti"""
+    ),
+    code_cell(
+        """tables["manifest_summary"]"""
+    ),
+    code_cell(
+        """manifest"""
     ),
     md_cell(
         """## Cleaning ve QA Ozetleri"""
@@ -162,10 +206,7 @@ print(result["paths"])
         """tables["top_domains"].head(20)"""
     ),
     md_cell(
-        """## Author Duzeyi Kontroller
-
-Saatlik penalty, dil cesitliligi, theme cesitliligi ve sentiment oynakligi burada gorulur.
-"""
+        """## Author Duzeyi Kontroller"""
     ),
     code_cell(
         """tables["hourly_heavy_authors"].head(20)"""
@@ -201,10 +242,7 @@ fig"""
         """tables["score_bands"]"""
     ),
     md_cell(
-        """## Keyword Dogrulama
-
-Keyword sinyali final formulde dusuk/orta agirlikta tutuluyor. Bu hucre, repeat/spam agir mesajlarla farkini hizli kontrol etmek icindir.
-"""
+        """## Keyword ve Spam Ornekleri"""
     ),
     code_cell(
         """tables["keyword_validation"]"""
@@ -229,10 +267,7 @@ Keyword sinyali final formulde dusuk/orta agirlikta tutuluyor. Bu hucre, repeat/
 ]].head(20)"""
     ),
     md_cell(
-        """## Skor Ciktilari
-
-Asagidaki tablo mesaj seviyesinde uretilecek temel risk ciktisini gosterir.
-"""
+        """## Skor Ciktilari"""
     ),
     code_cell(
         """result["scored_preview"][[
@@ -247,10 +282,54 @@ Asagidaki tablo mesaj seviyesinde uretilecek temel risk ciktisini gosterir.
 ]].head(20)"""
     ),
     md_cell(
-        """## Tek Mesaj Inference Scaffold
+        """## Final Score Dagilimi
 
-Bu hucre yeni bir mesaji ayni pipeline mantigi ile skorlamak icindir. Anonymous mesajlar author-level kismini notr gecer.
+Bu hucreler `scored_messages.parquet` icinden dagilimi ve band ayrisimini gosterir. Readiness check bu hucrelerden once calismis olmali.
 """
+    ),
+    code_cell(
+        """validate_scored_outputs(CONFIG, manifest)
+score_dist_path = Path(CONFIG["paths"]["scored_messages_parquet"])
+score_dist = pd.read_parquet(
+    score_dist_path,
+    columns=["final_score", "behavioral_score", "hard_bot_cluster_flag", "author_hard_hourly_flag"],
+)
+score_dist.describe(include="all")
+"""
+    ),
+    code_cell(
+        """fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+
+axes[0].hist(score_dist["final_score"], bins=50, color="#2563eb", edgecolor="white")
+axes[0].set_title("Final Score Histogram")
+axes[0].set_xlabel("final_score")
+axes[0].set_ylabel("rows")
+
+axes[1].hist(score_dist["final_score"], bins=50, color="#dc2626", edgecolor="white")
+axes[1].set_title("Final Score Histogram (Log Y)")
+axes[1].set_xlabel("final_score")
+axes[1].set_ylabel("rows")
+axes[1].set_yscale("log")
+
+fig.tight_layout()
+fig
+"""
+    ),
+    code_cell(
+        """score_bands_full = pd.cut(
+    score_dist["final_score"],
+    bins=[-0.001, 0.4, 0.6, 0.7, 0.85, 0.999999, 1.000001],
+    labels=["0.00-0.40", "0.40-0.60", "0.60-0.70", "0.70-0.85", "0.85-<1.0", "1.0"],
+    include_lowest=True,
+)
+
+score_band_summary = score_bands_full.value_counts(sort=False).rename_axis("band").reset_index(name="rows")
+score_band_summary["share"] = score_band_summary["rows"] / max(len(score_dist), 1)
+score_band_summary
+"""
+    ),
+    md_cell(
+        """## Tek Mesaj Inference Scaffold"""
     ),
     code_cell(
         """single_message = prepare_single_message_input(

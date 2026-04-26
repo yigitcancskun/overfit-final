@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import json
 import math
 import os
 import re
 import sqlite3
 import time
 import unicodedata
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,60 @@ COMMON_MULTI_PART_SUFFIXES = {
     "co.in",
     "com.cn",
 }
+
+PIPELINE_VERSION = "fusion-2026-04-27"
+STORE_SCHEMA_VERSION = "store-v2"
+SCORE_SCHEMA_VERSION = "score-v2"
+
+REQUIRED_BATCH_TABLES = ("cleaned_messages", "text_clusters", "text_window_clusters")
+REQUIRED_CLEANED_MESSAGE_COLUMNS = (
+    "message_id",
+    "normalized_text",
+    "text_hash",
+    "keyword_count",
+    "time_window_bucket",
+    "author_hash",
+    "author_type",
+    "text_length_chars",
+    "token_count",
+    "unique_token_count",
+    "max_token_frequency",
+    "max_token_ratio",
+    "repeated_token_count_over_2",
+    "hashtag_count",
+    "hashtag_density_chars",
+    "hashtag_density_tokens",
+    "is_long_text_flag",
+)
+REQUIRED_AUTHOR_SCORE_COLUMNS = (
+    "author_hash",
+    "author_score",
+    "author_hard_hourly_flag",
+    "max_posts_one_hour",
+    "language_nunique",
+    "theme_nunique",
+    "sentiment_std",
+    "median_interpost_sec",
+)
+REQUIRED_SCORED_MESSAGE_COLUMNS = (
+    "message_id",
+    "author_hash",
+    "author_type",
+    "normalized_text",
+    "same_text_repeat_count",
+    "same_text_unique_author_count",
+    "same_text_time_window_count",
+    "hashtag_count",
+    "max_token_frequency",
+    "max_token_ratio",
+    "spam_pattern_flag",
+    "hard_bot_cluster_flag",
+    "author_hard_hourly_flag",
+    "author_score",
+    "message_score",
+    "behavioral_score",
+    "final_score",
+)
 
 
 def get_available_memory_bytes() -> int:
@@ -900,6 +956,221 @@ def _scored_messages_path_from_config(config: dict[str, Any]) -> Path:
     return Path(config["paths"]["scored_messages_parquet"])
 
 
+def _manifest_path_from_config(config: dict[str, Any]) -> Path:
+    manifest_path = config["paths"].get("manifest_path", "data/fusion_manifest.json")
+    return Path(manifest_path)
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(sub_value) for key, sub_value in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return value
+
+
+def _extract_store_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "paths": {
+            "input_parquet": config["paths"]["input_parquet"],
+        },
+        "runtime": {
+            "top_n_domain_context": config["runtime"].get("top_n_domain_context"),
+        },
+        "thresholds": {
+            "min_text_len": config["thresholds"]["min_text_len"],
+            "rare_language_threshold": config["thresholds"]["rare_language_threshold"],
+            "long_text_start": config["thresholds"]["long_text_start"],
+            "hard_bot_time_window_sec": config["thresholds"]["hard_bot_time_window_sec"],
+        },
+        "rules": config.get("rules", {}),
+        "versions": {
+            "store_schema_version": STORE_SCHEMA_VERSION,
+        },
+    }
+
+
+def _extract_scoring_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "thresholds": {
+            "hourly_penalty_start": config["thresholds"]["hourly_penalty_start"],
+            "language_penalty_start": config["thresholds"]["language_penalty_start"],
+            "hard_bot_repeat_threshold": config["thresholds"]["hard_bot_repeat_threshold"],
+            "hard_bot_multi_author_threshold": config["thresholds"]["hard_bot_multi_author_threshold"],
+            "hard_bot_time_cluster_threshold": config["thresholds"]["hard_bot_time_cluster_threshold"],
+            "spam_repeat_threshold": config["thresholds"]["spam_repeat_threshold"],
+            "spam_multi_author_threshold": config["thresholds"]["spam_multi_author_threshold"],
+            "spam_time_cluster_threshold": config["thresholds"]["spam_time_cluster_threshold"],
+        },
+        "rules": config.get("rules", {}),
+        "weights": config["weights"],
+        "versions": {
+            "score_schema_version": SCORE_SCHEMA_VERSION,
+        },
+    }
+
+
+def compute_config_hash(payload: dict[str, Any]) -> str:
+    raw = json.dumps(_json_ready(payload), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Manifest not found at {path}. Run run_formula_pipeline_two_pass(CONFIG).")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_manifest(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _json_ready(payload)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def raise_schema_mismatch(subject: str, missing_columns: list[str], remedy: str) -> None:
+    missing_repr = ", ".join(repr(column) for column in missing_columns)
+    raise ValueError(f"{subject}: missing [{missing_repr}]. {remedy}")
+
+
+def _sqlite_table_names(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    return {row[0] for row in rows}
+
+
+def _sqlite_table_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return [row[1] for row in rows]
+
+
+def _parquet_columns(path: Path) -> list[str]:
+    return list(pq.ParquetFile(path).schema_arrow.names)
+
+
+def build_manifest_payload(
+    config: dict[str, Any],
+    *,
+    derived_thresholds: dict[str, Any] | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    created_value = created_at or datetime.now(timezone.utc).isoformat()
+    return {
+        "pipeline_version": PIPELINE_VERSION,
+        "store_schema_version": STORE_SCHEMA_VERSION,
+        "score_schema_version": SCORE_SCHEMA_VERSION,
+        "created_at": created_value,
+        "sqlite_path": str(_sqlite_path_from_config(config)),
+        "author_scores_path": str(_author_scores_path_from_config(config)),
+        "scored_messages_path": str(_scored_messages_path_from_config(config)),
+        "config_hash_for_store": compute_config_hash(_extract_store_config(config)),
+        "config_hash_for_scoring": compute_config_hash(_extract_scoring_config(config)),
+        "required_cleaned_message_columns": list(REQUIRED_CLEANED_MESSAGE_COLUMNS),
+        "required_author_score_columns": list(REQUIRED_AUTHOR_SCORE_COLUMNS),
+        "required_scored_message_columns": list(REQUIRED_SCORED_MESSAGE_COLUMNS),
+        "derived_thresholds": _json_ready(derived_thresholds or config.get("derived_thresholds", {})),
+    }
+
+
+def validate_existing_store(config: dict[str, Any], manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    db_path = _sqlite_path_from_config(config)
+    if not db_path.exists():
+        raise FileNotFoundError(f"SQLite store not found at {db_path}. Run run_formula_pipeline_two_pass(CONFIG).")
+
+    if manifest is not None:
+        expected_store_hash = compute_config_hash(_extract_store_config(config))
+        if manifest.get("store_schema_version") != STORE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Store schema version mismatch: manifest={manifest.get('store_schema_version')} code={STORE_SCHEMA_VERSION}. Full rebuild required."
+            )
+        if manifest.get("config_hash_for_store") != expected_store_hash:
+            raise RuntimeError("Store config hash mismatch. Full rebuild required.")
+
+    conn = get_sqlite_connection(db_path)
+    try:
+        table_names = _sqlite_table_names(conn)
+        missing_tables = sorted(set(REQUIRED_BATCH_TABLES) - table_names)
+        if missing_tables:
+            raise RuntimeError(
+                f"SQLite store is incomplete: missing tables {missing_tables}. Run run_formula_pipeline_two_pass(CONFIG)."
+            )
+
+        cleaned_columns = _sqlite_table_columns(conn, "cleaned_messages")
+        missing_cleaned_columns = sorted(set(REQUIRED_CLEANED_MESSAGE_COLUMNS) - set(cleaned_columns))
+        if missing_cleaned_columns:
+            raise_schema_mismatch(
+                "Store schema mismatch in cleaned_messages",
+                missing_cleaned_columns,
+                "Full rebuild required.",
+            )
+
+        return {
+            "sqlite_path": str(db_path),
+            "table_names": sorted(table_names),
+            "cleaned_message_columns": cleaned_columns,
+        }
+    finally:
+        conn.close()
+
+
+def validate_scored_outputs(config: dict[str, Any], manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    author_path = _author_scores_path_from_config(config)
+    scored_path = _scored_messages_path_from_config(config)
+    if not author_path.exists() or not scored_path.exists():
+        missing_paths = [str(path) for path in [author_path, scored_path] if not path.exists()]
+        raise FileNotFoundError(
+            f"Scored outputs missing: {missing_paths}. Run run_rescore_from_existing_store(CONFIG)."
+        )
+
+    if manifest is not None:
+        expected_score_hash = compute_config_hash(_extract_scoring_config(config))
+        if manifest.get("score_schema_version") != SCORE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Score schema version mismatch: manifest={manifest.get('score_schema_version')} code={SCORE_SCHEMA_VERSION}. Run run_rescore_from_existing_store(CONFIG)."
+            )
+        if manifest.get("config_hash_for_scoring") != expected_score_hash:
+            raise RuntimeError("Scoring config hash mismatch. Run run_rescore_from_existing_store(CONFIG).")
+
+    author_columns = _parquet_columns(author_path)
+    missing_author_columns = sorted(set(REQUIRED_AUTHOR_SCORE_COLUMNS) - set(author_columns))
+    if missing_author_columns:
+        raise_schema_mismatch(
+            "author_scores.parquet",
+            missing_author_columns,
+            "Run run_rescore_from_existing_store(CONFIG).",
+        )
+
+    scored_columns = _parquet_columns(scored_path)
+    missing_scored_columns = sorted(set(REQUIRED_SCORED_MESSAGE_COLUMNS) - set(scored_columns))
+    if missing_scored_columns:
+        raise_schema_mismatch(
+            "scored_messages.parquet",
+            missing_scored_columns,
+            "Run run_rescore_from_existing_store(CONFIG).",
+        )
+
+    return {
+        "author_columns": author_columns,
+        "scored_message_columns": scored_columns,
+    }
+
+
+def assert_artifacts_ready(result: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    manifest_path = _manifest_path_from_config(config)
+    manifest = load_manifest(manifest_path)
+    store_info = validate_existing_store(config, manifest)
+    score_info = validate_scored_outputs(config, manifest)
+    result["manifest"] = manifest
+    result["store_validation"] = store_info
+    result["score_validation"] = score_info
+    return result
+
+
 def get_sqlite_connection(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -921,6 +1192,10 @@ def initialize_batch_store(config: dict[str, Any]) -> None:
     scored_messages_path = _scored_messages_path_from_config(config)
     if scored_messages_path.exists() and config["runtime"]["overwrite_outputs"]:
         scored_messages_path.unlink()
+
+    manifest_path = _manifest_path_from_config(config)
+    if manifest_path.exists() and config["runtime"]["overwrite_outputs"]:
+        manifest_path.unlink()
 
     conn = get_sqlite_connection(db_path)
     try:
@@ -1199,14 +1474,17 @@ def _compute_author_features_from_frame(author_df: pd.DataFrame) -> pd.DataFrame
     return base.reset_index()
 
 
-def run_batch_pass2_author(config: dict[str, Any]) -> pd.DataFrame:
+def run_batch_pass2_author(config: dict[str, Any], *, refresh_clusters: bool = True) -> pd.DataFrame:
     conn = get_sqlite_connection(_sqlite_path_from_config(config))
     author_scores_path = _author_scores_path_from_config(config)
     author_batch_size = config["runtime"].get("author_batch_size", 5000)
     writer = None
     preview_frames: list[pd.DataFrame] = []
     try:
-        materialize_batch_cluster_tables(config)
+        if refresh_clusters:
+            materialize_batch_cluster_tables(config)
+        if author_scores_path.exists():
+            author_scores_path.unlink()
         author_cursor = conn.execute(
             "SELECT DISTINCT author_hash FROM cleaned_messages WHERE author_type = 'identified' AND author_hash IS NOT NULL ORDER BY author_hash"
         )
@@ -1269,6 +1547,8 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
     hashtag_examples: list[pd.DataFrame] = []
     token_examples: list[pd.DataFrame] = []
     try:
+        if scored_path.exists():
+            scored_path.unlink()
         while True:
             query = """
                 SELECT
@@ -1479,6 +1759,20 @@ def build_batch_summary_tables(config: dict[str, Any], pass1_summary: dict[str, 
     return tables
 
 
+def build_manifest_summary_table(manifest: dict[str, Any]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"field": "pipeline_version", "value": manifest.get("pipeline_version")},
+            {"field": "store_schema_version", "value": manifest.get("store_schema_version")},
+            {"field": "score_schema_version", "value": manifest.get("score_schema_version")},
+            {"field": "created_at", "value": manifest.get("created_at")},
+            {"field": "config_hash_for_store", "value": manifest.get("config_hash_for_store")},
+            {"field": "config_hash_for_scoring", "value": manifest.get("config_hash_for_scoring")},
+            {"field": "hourly_hard_knee", "value": manifest.get("derived_thresholds", {}).get("hourly_hard_knee")},
+        ]
+    )
+
+
 def compute_message_refs_from_sqlite(config: dict[str, Any]) -> dict[str, Any]:
     conn = get_sqlite_connection(_sqlite_path_from_config(config))
     try:
@@ -1563,15 +1857,72 @@ def run_formula_pipeline_two_pass(config: dict[str, Any]) -> dict[str, Any]:
     refs = compute_message_refs_from_sqlite(config)
     message_artifacts = run_batch_pass2_message(config, refs)
     tables = build_batch_summary_tables(config, pass1_summary, author_scores, message_artifacts)
+    manifest = build_manifest_payload(config)
+    manifest = write_manifest(_manifest_path_from_config(config), manifest)
+    tables["manifest_summary"] = build_manifest_summary_table(manifest)
     return {
         "summary": pass1_summary,
         "tables": tables,
         "author_scores": author_scores,
         "scored_preview": message_artifacts["scored_preview"],
+        "manifest": manifest,
         "paths": {
             "sqlite_db": str(_sqlite_path_from_config(config)),
             "author_scores_parquet": str(_author_scores_path_from_config(config)),
             "scored_messages_parquet": str(_scored_messages_path_from_config(config)),
+            "manifest_json": str(_manifest_path_from_config(config)),
+        },
+    }
+
+
+def run_rescore_from_existing_store(config: dict[str, Any]) -> dict[str, Any]:
+    manifest_path = _manifest_path_from_config(config)
+    if manifest_path.exists():
+        manifest = load_manifest(manifest_path)
+        validate_existing_store(config, manifest)
+    else:
+        validate_existing_store(config, None)
+        manifest = write_manifest(manifest_path, build_manifest_payload(config))
+
+    author_scores = run_batch_pass2_author(config, refresh_clusters=False)
+    refs = compute_message_refs_from_sqlite(config)
+    message_artifacts = run_batch_pass2_message(config, refs)
+
+    conn = get_sqlite_connection(_sqlite_path_from_config(config))
+    try:
+        clean_rows = int(conn.execute("SELECT COUNT(*) FROM cleaned_messages").fetchone()[0])
+        missing_author_rows = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM cleaned_messages WHERE author_type = 'anonymous' OR author_hash_missing_flag = 1"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+    summary = {
+        "clean_rows": clean_rows,
+        "missing_author_rows": missing_author_rows,
+        "technical_duplicates_removed": pd.NA,
+        "rescore_only": True,
+    }
+    tables = build_batch_summary_tables(config, summary, author_scores, message_artifacts)
+    manifest = build_manifest_payload(config, created_at=manifest.get("created_at"))
+    manifest["last_rescore_at"] = datetime.now(timezone.utc).isoformat()
+    manifest = write_manifest(manifest_path, manifest)
+    tables["manifest_summary"] = build_manifest_summary_table(manifest)
+
+    validate_scored_outputs(config, manifest)
+    return {
+        "summary": summary,
+        "tables": tables,
+        "author_scores": author_scores,
+        "scored_preview": message_artifacts["scored_preview"],
+        "manifest": manifest,
+        "paths": {
+            "sqlite_db": str(_sqlite_path_from_config(config)),
+            "author_scores_parquet": str(_author_scores_path_from_config(config)),
+            "scored_messages_parquet": str(_scored_messages_path_from_config(config)),
+            "manifest_json": str(manifest_path),
         },
     }
 
