@@ -28,16 +28,29 @@ CONFIG = {
         "author_scores_parquet": "data/fusion_author_scores.parquet",
         "scored_messages_parquet": "data/fusion_scored_messages.parquet",
         "manifest_path": "data/fusion_manifest.json",
+        "author_feature_stage_parquet": "data/fusion_author_feature_stage.parquet",
     },
     "runtime": {
         "mode": "full",
+        "build_mode": "lean",
         "batch_size": 50_000,
         "max_batches": None,
         "sample_n_rows": None,
         "overwrite_outputs": True,
+        "enable_progress_logs": True,
+        "progress_every_batches": 5,
         "top_n_domain_context": 128,
         "author_batch_size": 5_000,
         "message_batch_size": 100_000,
+    },
+    "semantic_adapter": {
+        "enabled": True,
+        "model_name": "junaid1993/distilroberta-bot-detection",
+        "supported_languages": ["en"],
+        "unsupported_language_score": 0.50,
+        "max_length": 512,
+        "batch_size": 32,
+        "device": "auto",
     },
     "thresholds": {
         "min_text_len": 5,
@@ -58,6 +71,10 @@ CONFIG = {
     },
     "derived_thresholds": {},
     "weights": {
+        "behavioral_vs_semantic": {
+            "behavioral": 0.60,
+            "semantic": 0.40,
+        },
         "author_vs_message": {
             "author": 0.70,
             "message": 0.30,
@@ -98,9 +115,13 @@ Tum gorsellestirme hucreleri oncesinde artefact readiness kontrolu zorunludur. E
     ),
     code_cell(CONFIG_CELL),
     code_cell(
-        """import matplotlib.pyplot as plt
+        """import importlib
+import matplotlib.pyplot as plt
 import pandas as pd
 import pyarrow.parquet as pq
+
+import formula_scoring_pipeline as formula_scoring_pipeline
+importlib.reload(formula_scoring_pipeline)
 
 from formula_scoring_pipeline import (
     assert_artifacts_ready,
@@ -149,7 +170,7 @@ print(result["paths"])
     md_cell(
         """## Rescore From Existing Store
 
-Weight veya scoring threshold degistiginde bu hucreyi calistirin. Bu adim SQLite store'u yeniden olusturmaz; yalnizca `author_scores.parquet` ve `scored_messages.parquet` dosyalarini overwrite eder.
+Weight veya scoring threshold degistiginde bu hucreyi calistirin. Bu adim SQLite store'u yeniden olusturmaz; yalnizca `author_scores.parquet` ve `scored_messages.parquet` dosyalarini overwrite eder. Semantic adapter skoru store icinde saklandigi icin weight denemelerinde model yeniden kosmaz.
 """
     ),
     code_cell(
@@ -198,6 +219,9 @@ print({
     ),
     code_cell(
         """tables["derived_thresholds"]"""
+    ),
+    code_cell(
+        """tables["semantic_adapter_summary"]"""
     ),
     code_cell(
         """tables["top128_coverage"]"""
@@ -277,6 +301,8 @@ fig"""
     "author_score",
     "message_score",
     "behavioral_score",
+    "roberta_score",
+    "semantic_score",
     "final_score",
     "hard_bot_cluster_flag",
 ]].head(20)"""
@@ -292,7 +318,7 @@ Bu hucreler `scored_messages.parquet` icinden dagilimi ve band ayrisimini goster
 score_dist_path = Path(CONFIG["paths"]["scored_messages_parquet"])
 score_dist = pd.read_parquet(
     score_dist_path,
-    columns=["final_score", "behavioral_score", "hard_bot_cluster_flag", "author_hard_hourly_flag"],
+    columns=["final_score", "behavioral_score", "semantic_score", "roberta_score", "hard_bot_cluster_flag", "author_hard_hourly_flag"],
 )
 score_dist.describe(include="all")
 """

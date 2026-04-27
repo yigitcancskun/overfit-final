@@ -1,4 +1,5 @@
 pandas
+numpy
 pyarrow
 jupyter
 ipykernel
@@ -6,3 +7,7 @@ matplotlib
 seaborn
 tldextract
 plotly
+psutil
+transformers
+torch
+safetensors

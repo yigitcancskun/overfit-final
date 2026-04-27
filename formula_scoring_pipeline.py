@@ -31,6 +31,17 @@ try:
 except ImportError:
     tldextract = None
 
+try:
+    import torch  # type: ignore
+except ImportError:
+    torch = None
+
+try:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer  # type: ignore
+except ImportError:
+    AutoModelForSequenceClassification = None
+    AutoTokenizer = None
+
 
 MISSING_PLACEHOLDERS = {"", "nan", "null", "none", "n/a"}
 BLANK_SENSITIVE_COLUMNS = ["author_hash", "original_text", "english_keywords", "primary_theme"]
@@ -57,6 +68,7 @@ SCORE_SCHEMA_VERSION = "score-v2"
 REQUIRED_BATCH_TABLES = ("cleaned_messages", "text_clusters", "text_window_clusters")
 REQUIRED_CLEANED_MESSAGE_COLUMNS = (
     "message_id",
+    "original_text",
     "normalized_text",
     "text_hash",
     "keyword_count",
@@ -72,6 +84,8 @@ REQUIRED_CLEANED_MESSAGE_COLUMNS = (
     "hashtag_count",
     "hashtag_density_chars",
     "hashtag_density_tokens",
+    "roberta_score",
+    "semantic_model_applied_flag",
     "is_long_text_flag",
 )
 REQUIRED_AUTHOR_SCORE_COLUMNS = (
@@ -88,7 +102,6 @@ REQUIRED_SCORED_MESSAGE_COLUMNS = (
     "message_id",
     "author_hash",
     "author_type",
-    "normalized_text",
     "same_text_repeat_count",
     "same_text_unique_author_count",
     "same_text_time_window_count",
@@ -101,7 +114,85 @@ REQUIRED_SCORED_MESSAGE_COLUMNS = (
     "author_score",
     "message_score",
     "behavioral_score",
+    "roberta_score",
+    "semantic_score",
     "final_score",
+)
+
+CLEANED_MESSAGE_SCHEMA = {
+    "row_fingerprint": "TEXT NOT NULL UNIQUE",
+    "original_text": "TEXT",
+    "normalized_text": "TEXT",
+    "text_hash": "TEXT",
+    "english_keywords_clean": "TEXT",
+    "keyword_count": "INTEGER",
+    "primary_theme": "TEXT",
+    "sentiment": "REAL",
+    "main_emotion": "TEXT",
+    "language": "TEXT",
+    "url": "TEXT",
+    "raw_url_domain": "TEXT",
+    "registered_domain": "TEXT",
+    "subdomain": "TEXT",
+    "date": "TEXT",
+    "time_window_bucket": "INTEGER",
+    "author_hash": "TEXT",
+    "author_type": "TEXT",
+    "author_hash_missing_flag": "INTEGER",
+    "text_length_chars": "INTEGER",
+    "token_count": "INTEGER",
+    "unique_token_count": "INTEGER",
+    "max_token_frequency": "INTEGER",
+    "max_token_ratio": "REAL",
+    "repeated_token_count_over_2": "INTEGER",
+    "hashtag_count": "INTEGER",
+    "hashtag_density_chars": "REAL",
+    "hashtag_density_tokens": "REAL",
+    "roberta_score": "REAL",
+    "semantic_model_applied_flag": "INTEGER",
+    "is_short_text": "INTEGER",
+    "is_long_text_flag": "INTEGER",
+    "is_empty_text": "INTEGER",
+}
+
+LEAN_STORE_COLUMNS = (
+    "row_fingerprint",
+    "original_text",
+    "normalized_text",
+    "text_hash",
+    "keyword_count",
+    "primary_theme",
+    "sentiment",
+    "language",
+    "registered_domain",
+    "date",
+    "time_window_bucket",
+    "author_hash",
+    "author_type",
+    "author_hash_missing_flag",
+    "text_length_chars",
+    "token_count",
+    "unique_token_count",
+    "max_token_frequency",
+    "max_token_ratio",
+    "repeated_token_count_over_2",
+    "hashtag_count",
+    "hashtag_density_chars",
+    "hashtag_density_tokens",
+    "roberta_score",
+    "semantic_model_applied_flag",
+    "is_short_text",
+    "is_long_text_flag",
+    "is_empty_text",
+)
+
+DEBUG_EXTRA_STORE_COLUMNS = (
+    "original_text",
+    "english_keywords_clean",
+    "main_emotion",
+    "url",
+    "raw_url_domain",
+    "subdomain",
 )
 
 
@@ -187,6 +278,10 @@ def count_keywords_scalar(value: Any) -> int:
 
 TOKEN_PATTERN = re.compile(r"\b\w+\b", flags=re.UNICODE)
 HASHTAG_PATTERN = re.compile(r"(?<!\w)#[\w_]+", flags=re.UNICODE)
+SEMANTIC_URL_PATTERN = re.compile(r"http\S+|www\.\S+", flags=re.IGNORECASE)
+SEMANTIC_USER_TAG_PATTERN = re.compile(r"[@#]", flags=re.UNICODE)
+SEMANTIC_PUNCT_PATTERN = re.compile(r"[^\w\s]", flags=re.UNICODE)
+SEMANTIC_NUMBER_PATTERN = re.compile(r"\d+", flags=re.UNICODE)
 
 
 def extract_text_stats_scalar(value: Any) -> dict[str, float]:
@@ -237,6 +332,98 @@ def extract_text_stats_scalar(value: Any) -> dict[str, float]:
 def extract_text_stats_series(series: pd.Series) -> pd.DataFrame:
     stats = series.map(extract_text_stats_scalar)
     return pd.DataFrame(stats.tolist(), index=series.index)
+
+
+def preprocess_semantic_text_scalar(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value)
+    text = SEMANTIC_URL_PATTERN.sub(" ", text)
+    text = SEMANTIC_USER_TAG_PATTERN.sub("", text)
+    text = SEMANTIC_PUNCT_PATTERN.sub(" ", text)
+    text = SEMANTIC_NUMBER_PATTERN.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.lower()
+
+
+def detect_torch_device(config: dict[str, Any]) -> str:
+    preferred = config["semantic_adapter"].get("device", "auto")
+    if preferred != "auto":
+        return preferred
+    if torch is None:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+@lru_cache(maxsize=2)
+def _load_semantic_adapter_cached(model_name: str, device: str):
+    if AutoTokenizer is None or AutoModelForSequenceClassification is None or torch is None:
+        raise ImportError(
+            "transformers and torch are required for semantic adapter. Install requirements and rerun."
+        )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    model.eval()
+    model.to(device)
+    return tokenizer, model
+
+
+def compute_roberta_scores_for_batch(batch_df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    semantic_cfg = config["semantic_adapter"]
+    neutral_score = float(semantic_cfg["unsupported_language_score"])
+    output = pd.DataFrame(
+        {
+            "roberta_score": np.full(len(batch_df), neutral_score, dtype="float32"),
+            "semantic_model_applied_flag": np.zeros(len(batch_df), dtype="int8"),
+        },
+        index=batch_df.index,
+    )
+    if not semantic_cfg.get("enabled", True):
+        return output
+
+    supported_languages = {str(lang).lower() for lang in semantic_cfg.get("supported_languages", ["en"])}
+    language_series = batch_df["language"].astype("string").fillna("").str.lower()
+    supported_mask = language_series.isin(supported_languages)
+    if not bool(supported_mask.any()):
+        return output
+
+    texts = batch_df.loc[supported_mask, "original_text"].map(preprocess_semantic_text_scalar)
+    non_empty_mask = texts.str.len().fillna(0).gt(0)
+    if not bool(non_empty_mask.any()):
+        return output
+
+    device = detect_torch_device(config)
+    tokenizer, model = _load_semantic_adapter_cached(semantic_cfg["model_name"], device)
+    batch_size = int(semantic_cfg["batch_size"])
+    max_length = int(semantic_cfg["max_length"])
+    inference_indices = texts.index[non_empty_mask]
+    inference_texts = texts.loc[non_empty_mask].tolist()
+    score_values: list[float] = []
+
+    for start in range(0, len(inference_texts), batch_size):
+        stop = start + batch_size
+        text_batch = inference_texts[start:stop]
+        encoded = tokenizer(
+            text_batch,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=max_length,
+        )
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+        with torch.inference_mode():
+            logits = model(**encoded).logits
+            probabilities = torch.nn.functional.softmax(logits, dim=-1)[:, 1]
+        score_values.extend(probabilities.detach().cpu().tolist())
+
+    output.loc[inference_indices, "roberta_score"] = np.array(score_values, dtype="float32")
+    output.loc[inference_indices, "semantic_model_applied_flag"] = 1
+    return output
 
 
 @lru_cache(maxsize=50_000)
@@ -341,6 +528,9 @@ def clean_batch(batch_df: pd.DataFrame, config: dict[str, Any], rare_languages: 
     domain_parts = extract_domain_columns(batch_df["url"])
     batch_df = batch_df.drop(columns=["raw_url_domain", "registered_domain", "subdomain"], errors="ignore")
     batch_df = pd.concat([batch_df, domain_parts], axis=1)
+    semantic_scores = compute_roberta_scores_for_batch(batch_df, config)
+    batch_df["roberta_score"] = semantic_scores["roberta_score"]
+    batch_df["semantic_model_applied_flag"] = semantic_scores["semantic_model_applied_flag"].astype("int8")
     return batch_df
 
 
@@ -798,10 +988,14 @@ def compute_final_scores(
         df["message_score"],
         (author_weight * df["author_score"].fillna(0.0) + message_weight * df["message_score"]).clip(0, 1),
     )
+    df["semantic_score"] = df["roberta_score"].fillna(config["semantic_adapter"]["unsupported_language_score"]).clip(0, 1)
     df["final_score"] = np.where(
         df["author_hard_hourly_flag"].fillna(0).eq(1) | df["hard_bot_cluster_flag"].eq(1),
         1.0,
-        df["behavioral_score"],
+        (
+            config["weights"]["behavioral_vs_semantic"]["behavioral"] * df["behavioral_score"]
+            + config["weights"]["behavioral_vs_semantic"]["semantic"] * df["semantic_score"]
+        ).clip(0, 1),
     )
     return df
 
@@ -961,6 +1155,26 @@ def _manifest_path_from_config(config: dict[str, Any]) -> Path:
     return Path(manifest_path)
 
 
+def _author_feature_stage_path_from_config(config: dict[str, Any]) -> Path:
+    stage_path = config["paths"].get("author_feature_stage_parquet", "data/fusion_author_feature_stage.parquet")
+    return Path(stage_path)
+
+
+def get_store_columns(config: dict[str, Any]) -> tuple[str, ...]:
+    build_mode = config["runtime"].get("build_mode", "lean")
+    if build_mode == "debug":
+        return LEAN_STORE_COLUMNS + DEBUG_EXTRA_STORE_COLUMNS
+    return LEAN_STORE_COLUMNS
+
+
+def log_progress(stage: str, message: str, *, config: dict[str, Any] | None = None) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    if config is not None and config["runtime"].get("enable_progress_logs", True):
+        print(f"[{timestamp}] [{stage}] {message}")
+    elif config is None:
+        print(f"[{timestamp}] [{stage}] {message}")
+
+
 def _json_ready(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_ready(sub_value) for key, sub_value in value.items()}
@@ -982,6 +1196,7 @@ def _extract_store_config(config: dict[str, Any]) -> dict[str, Any]:
         },
         "runtime": {
             "top_n_domain_context": config["runtime"].get("top_n_domain_context"),
+            "build_mode": config["runtime"].get("build_mode", "lean"),
         },
         "thresholds": {
             "min_text_len": config["thresholds"]["min_text_len"],
@@ -990,9 +1205,11 @@ def _extract_store_config(config: dict[str, Any]) -> dict[str, Any]:
             "hard_bot_time_window_sec": config["thresholds"]["hard_bot_time_window_sec"],
         },
         "rules": config.get("rules", {}),
+        "semantic_adapter": config["semantic_adapter"],
         "versions": {
             "store_schema_version": STORE_SCHEMA_VERSION,
         },
+        "store_columns": list(get_store_columns(config)),
     }
 
 
@@ -1058,8 +1275,12 @@ def build_manifest_payload(
     *,
     derived_thresholds: dict[str, Any] | None = None,
     created_at: str | None = None,
+    actual_store_columns: list[str] | None = None,
+    actual_score_columns: list[str] | None = None,
 ) -> dict[str, Any]:
     created_value = created_at or datetime.now(timezone.utc).isoformat()
+    store_columns = actual_store_columns or list(get_store_columns(config))
+    score_columns = actual_score_columns or list(REQUIRED_SCORED_MESSAGE_COLUMNS)
     return {
         "pipeline_version": PIPELINE_VERSION,
         "store_schema_version": STORE_SCHEMA_VERSION,
@@ -1073,6 +1294,9 @@ def build_manifest_payload(
         "required_cleaned_message_columns": list(REQUIRED_CLEANED_MESSAGE_COLUMNS),
         "required_author_score_columns": list(REQUIRED_AUTHOR_SCORE_COLUMNS),
         "required_scored_message_columns": list(REQUIRED_SCORED_MESSAGE_COLUMNS),
+        "store_columns": store_columns,
+        "store_schema_fingerprint": compute_config_hash({"store_columns": sorted(store_columns)}),
+        "score_schema_fingerprint": compute_config_hash({"scored_columns": sorted(score_columns)}),
         "derived_thresholds": _json_ready(derived_thresholds or config.get("derived_thresholds", {})),
     }
 
@@ -1108,6 +1332,13 @@ def validate_existing_store(config: dict[str, Any], manifest: dict[str, Any] | N
                 missing_cleaned_columns,
                 "Full rebuild required.",
             )
+
+        if manifest is not None:
+            actual_store_fingerprint = compute_config_hash(
+                {"store_columns": sorted([column for column in cleaned_columns if column != "message_id"])}
+            )
+            if manifest.get("store_schema_fingerprint") != actual_store_fingerprint:
+                raise RuntimeError("Store schema fingerprint mismatch. Full rebuild required.")
 
         return {
             "sqlite_path": str(db_path),
@@ -1154,6 +1385,11 @@ def validate_scored_outputs(config: dict[str, Any], manifest: dict[str, Any] | N
             "Run run_rescore_from_existing_store(CONFIG).",
         )
 
+    if manifest is not None:
+        actual_score_fingerprint = compute_config_hash({"scored_columns": sorted(scored_columns)})
+        if manifest.get("score_schema_fingerprint") != actual_score_fingerprint:
+            raise RuntimeError("Score schema fingerprint mismatch. Run run_rescore_from_existing_store(CONFIG).")
+
     return {
         "author_columns": author_columns,
         "scored_message_columns": scored_columns,
@@ -1197,43 +1433,21 @@ def initialize_batch_store(config: dict[str, Any]) -> None:
     if manifest_path.exists() and config["runtime"]["overwrite_outputs"]:
         manifest_path.unlink()
 
+    author_feature_stage_path = _author_feature_stage_path_from_config(config)
+    if author_feature_stage_path.exists() and config["runtime"]["overwrite_outputs"]:
+        author_feature_stage_path.unlink()
+
     conn = get_sqlite_connection(db_path)
     try:
+        store_columns = get_store_columns(config)
+        schema_parts = ["message_id INTEGER PRIMARY KEY AUTOINCREMENT"]
+        for column in store_columns:
+            schema_parts.append(f"{column} {CLEANED_MESSAGE_SCHEMA[column]}")
+        create_table_sql = ",\n                ".join(schema_parts)
         conn.executescript(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS cleaned_messages (
-                message_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                row_fingerprint TEXT NOT NULL UNIQUE,
-                original_text TEXT,
-                normalized_text TEXT,
-                text_hash TEXT,
-                english_keywords_clean TEXT,
-                keyword_count INTEGER,
-                primary_theme TEXT,
-                sentiment REAL,
-                main_emotion TEXT,
-                language TEXT,
-                url TEXT,
-                raw_url_domain TEXT,
-                registered_domain TEXT,
-                subdomain TEXT,
-                date TEXT,
-                time_window_bucket INTEGER,
-                author_hash TEXT,
-                author_type TEXT,
-                author_hash_missing_flag INTEGER,
-                text_length_chars INTEGER,
-                token_count INTEGER,
-                unique_token_count INTEGER,
-                max_token_frequency INTEGER,
-                max_token_ratio REAL,
-                repeated_token_count_over_2 INTEGER,
-                hashtag_count INTEGER,
-                hashtag_density_chars REAL,
-                hashtag_density_tokens REAL,
-                is_short_text INTEGER,
-                is_long_text_flag INTEGER,
-                is_empty_text INTEGER
+                {create_table_sql}
             );
             CREATE INDEX IF NOT EXISTS idx_cleaned_author_date ON cleaned_messages(author_hash, date);
             CREATE INDEX IF NOT EXISTS idx_cleaned_text_hash ON cleaned_messages(text_hash);
@@ -1255,39 +1469,7 @@ def _prepare_sqlite_rows(batch_df: pd.DataFrame, config: dict[str, Any]) -> list
     date_ns = valid_date.astype("int64", copy=False)
     df["time_window_bucket"] = date_ns.floordiv(window_seconds * 1_000_000_000).where(valid_date.notna(), pd.NA)
 
-    columns = [
-        "row_fingerprint",
-        "original_text",
-        "normalized_text",
-        "text_hash",
-        "english_keywords_clean",
-        "keyword_count",
-        "primary_theme",
-        "sentiment",
-        "main_emotion",
-        "language",
-        "url",
-        "raw_url_domain",
-        "registered_domain",
-        "subdomain",
-        "date",
-        "time_window_bucket",
-        "author_hash",
-        "author_type",
-        "author_hash_missing_flag",
-        "text_length_chars",
-        "token_count",
-        "unique_token_count",
-        "max_token_frequency",
-        "max_token_ratio",
-        "repeated_token_count_over_2",
-        "hashtag_count",
-        "hashtag_density_chars",
-        "hashtag_density_tokens",
-        "is_short_text",
-        "is_long_text_flag",
-        "is_empty_text",
-    ]
+    columns = list(get_store_columns(config))
     rows: list[tuple[Any, ...]] = []
     for record in df[columns].itertuples(index=False, name=None):
         converted = []
@@ -1318,20 +1500,21 @@ def run_batch_pass1(config: dict[str, Any]) -> dict[str, Any]:
         "empty_text_rows": 0,
         "short_text_rows": 0,
         "bad_date_rows": 0,
+        "semantic_applied_rows": 0,
         "batch_size": batch_size,
     }
     conn = get_sqlite_connection(db_path)
     start = time.time()
     try:
+        store_columns = list(get_store_columns(config))
+        insert_columns_sql = ", ".join(store_columns)
+        insert_placeholders_sql = ", ".join("?" for _ in store_columns)
         insert_sql = """
             INSERT OR IGNORE INTO cleaned_messages (
-                row_fingerprint, original_text, normalized_text, text_hash, english_keywords_clean, keyword_count,
-                primary_theme, sentiment, main_emotion, language, url, raw_url_domain, registered_domain, subdomain,
-                date, time_window_bucket, author_hash, author_type, author_hash_missing_flag, text_length_chars,
-                token_count, unique_token_count, max_token_frequency, max_token_ratio, repeated_token_count_over_2,
-                hashtag_count, hashtag_density_chars, hashtag_density_tokens, is_short_text, is_long_text_flag, is_empty_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """ + insert_columns_sql + """
+            ) VALUES (""" + insert_placeholders_sql + """)
         """
+        progress_every = max(int(config["runtime"].get("progress_every_batches", 5)), 1)
         for batch_id, batch_df in enumerate(iter_pandas_batches(input_path, batch_size=batch_size), start=1):
             if max_batches and batch_id > max_batches:
                 break
@@ -1350,6 +1533,16 @@ def run_batch_pass1(config: dict[str, Any]) -> dict[str, Any]:
             summary["empty_text_rows"] += int(cleaned_batch["is_empty_text"].sum())
             summary["short_text_rows"] += int(cleaned_batch["is_short_text"].sum())
             summary["bad_date_rows"] += int(cleaned_batch["date"].isna().sum())
+            summary["semantic_applied_rows"] += int(cleaned_batch["semantic_model_applied_flag"].sum())
+
+            if batch_id == 1 or batch_id % progress_every == 0:
+                db_size_mb = round(db_path.stat().st_size / 1024**2, 1) if db_path.exists() else 0.0
+                elapsed_min = round((time.time() - start) / 60, 2)
+                log_progress(
+                    "PASS1",
+                    f"batch={batch_id} raw_rows={summary['raw_rows']:,} clean_rows={summary['clean_rows']:,} duplicates_removed={summary['technical_duplicates_removed']:,} semantic_applied_rows={summary['semantic_applied_rows']:,} db_size_mb={db_size_mb} elapsed_min={elapsed_min}",
+                    config=config,
+                )
 
             if max_rows and summary["clean_rows"] >= max_rows:
                 break
@@ -1365,6 +1558,7 @@ def run_batch_pass1(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def materialize_batch_cluster_tables(config: dict[str, Any]) -> None:
+    log_progress("CLUSTERS", "materializing text_clusters and text_window_clusters", config=config)
     conn = get_sqlite_connection(_sqlite_path_from_config(config))
     try:
         conn.executescript(
@@ -1393,6 +1587,7 @@ def materialize_batch_cluster_tables(config: dict[str, Any]) -> None:
             """
         )
         conn.commit()
+        log_progress("CLUSTERS", "cluster tables ready", config=config)
     finally:
         conn.close()
 
@@ -1437,7 +1632,6 @@ def _compute_author_features_from_frame(author_df: pd.DataFrame) -> pd.DataFrame
 
     hourly_counts = author_df.groupby(["author_hash", "hour_bucket"]).size().rename("hour_post_count")
     base["max_posts_one_hour"] = hourly_counts.groupby("author_hash").max()
-    base["hourly_post_distribution"] = hourly_counts.groupby("author_hash").apply(lambda s: s.tolist())
 
     author_df = author_df.sort_values(["author_hash", "date"]).copy()
     author_df["interpost_sec"] = author_df.groupby("author_hash")["date"].diff().dt.total_seconds()
@@ -1474,35 +1668,84 @@ def _compute_author_features_from_frame(author_df: pd.DataFrame) -> pd.DataFrame
     return base.reset_index()
 
 
+def _append_parquet_table(
+    path: Path,
+    frame: pd.DataFrame,
+    writer: pq.ParquetWriter | None,
+    *,
+    compression: str = "snappy",
+) -> pq.ParquetWriter:
+    table = pa.Table.from_pandas(frame, preserve_index=False)
+    if writer is None:
+        writer = pq.ParquetWriter(path, table.schema, compression=compression)
+    writer.write_table(table)
+    return writer
+
+
 def run_batch_pass2_author(config: dict[str, Any], *, refresh_clusters: bool = True) -> pd.DataFrame:
     conn = get_sqlite_connection(_sqlite_path_from_config(config))
     author_scores_path = _author_scores_path_from_config(config)
+    author_feature_stage_path = _author_feature_stage_path_from_config(config)
     author_batch_size = config["runtime"].get("author_batch_size", 5000)
-    writer = None
+    feature_writer = None
+    score_writer = None
     preview_frames: list[pd.DataFrame] = []
+    author_feature_frames_for_refs: list[pd.DataFrame] = []
     try:
         if refresh_clusters:
             materialize_batch_cluster_tables(config)
         if author_scores_path.exists():
             author_scores_path.unlink()
+        if author_feature_stage_path.exists():
+            author_feature_stage_path.unlink()
         author_cursor = conn.execute(
             "SELECT DISTINCT author_hash FROM cleaned_messages WHERE author_type = 'identified' AND author_hash IS NOT NULL ORDER BY author_hash"
         )
-        author_frames: list[pd.DataFrame] = []
+        batch_counter = 0
+        progress_every = max(int(config["runtime"].get("progress_every_batches", 5)), 1)
         while True:
             rows = author_cursor.fetchmany(author_batch_size)
             if not rows:
                 break
+            batch_counter += 1
             author_ids = [row[0] for row in rows if row[0] is not None]
             author_batch_frame = _fetch_author_batch_frame(conn, author_ids)
             batch_features = _compute_author_features_from_frame(author_batch_frame)
-            author_frames.append(batch_features)
-        all_author_features = pd.concat(author_frames, ignore_index=True) if author_frames else pd.DataFrame()
-        refs = fit_normalization_reference(all_author_features, pd.DataFrame(), config)
-        author_scores = compute_author_scores(all_author_features, refs, config)
-        table = pa.Table.from_pandas(author_scores, preserve_index=False)
-        writer = pq.ParquetWriter(author_scores_path, table.schema, compression="snappy")
-        writer.write_table(table)
+            if not batch_features.empty:
+                feature_writer = _append_parquet_table(author_feature_stage_path, batch_features, feature_writer)
+                author_feature_frames_for_refs.append(
+                    batch_features[
+                        [
+                            "posts_per_day",
+                            "posts_per_active_hour",
+                            "theme_nunique",
+                            "sentiment_std",
+                            "same_text_repeat_ratio",
+                            "same_text_repeat_max",
+                            "multi_author_repeat_ratio",
+                            "mean_interpost_sec",
+                            "median_interpost_sec",
+                            "p10_interpost_sec",
+                            "interval_cv",
+                            "max_posts_one_hour",
+                            "language_nunique",
+                        ]
+                    ].copy()
+                )
+            if batch_counter == 1 or batch_counter % progress_every == 0:
+                log_progress(
+                    "PASS2_AUTHOR_STAGE",
+                    f"author_batches={batch_counter} staged_authors={sum(len(frame) for frame in author_feature_frames_for_refs):,}",
+                    config=config,
+                )
+            del author_batch_frame, batch_features
+            gc.collect()
+
+        ref_source = pd.concat(author_feature_frames_for_refs, ignore_index=True) if author_feature_frames_for_refs else pd.DataFrame()
+        refs = fit_normalization_reference(ref_source, pd.DataFrame(), config)
+        if feature_writer is not None:
+            feature_writer.close()
+            feature_writer = None
 
         conn.execute("DROP TABLE IF EXISTS author_scores")
         conn.execute(
@@ -1519,18 +1762,45 @@ def run_batch_pass2_author(config: dict[str, Any], *, refresh_clusters: bool = T
             )
             """
         )
-        conn.executemany(
-            "INSERT INTO author_scores(author_hash, author_score, author_hard_hourly_flag, max_posts_one_hour, language_nunique, theme_nunique, sentiment_std, median_interpost_sec) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            author_scores[
-                ["author_hash", "author_score", "author_hard_hourly_flag", "max_posts_one_hour", "language_nunique", "theme_nunique", "sentiment_std", "median_interpost_sec"]
-            ].itertuples(index=False, name=None),
-        )
-        conn.commit()
-        preview_frames.append(author_scores.head(50))
-        return author_scores
+
+        scored_batches = 0
+        total_scored_authors = 0
+        for feature_batch in iter_pandas_batches(author_feature_stage_path, batch_size=author_batch_size):
+            scored_batches += 1
+            scored_batch = compute_author_scores(feature_batch, refs, config)
+            total_scored_authors += len(scored_batch)
+            score_writer = _append_parquet_table(author_scores_path, scored_batch, score_writer)
+            conn.executemany(
+                "INSERT INTO author_scores(author_hash, author_score, author_hard_hourly_flag, max_posts_one_hour, language_nunique, theme_nunique, sentiment_std, median_interpost_sec) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                scored_batch[
+                    ["author_hash", "author_score", "author_hard_hourly_flag", "max_posts_one_hour", "language_nunique", "theme_nunique", "sentiment_std", "median_interpost_sec"]
+                ].itertuples(index=False, name=None),
+            )
+            conn.commit()
+            if not preview_frames:
+                preview_frames.append(scored_batch.head(50).copy())
+            if scored_batches == 1 or scored_batches % progress_every == 0:
+                log_progress(
+                    "PASS2_AUTHOR_SCORE",
+                    f"score_batches={scored_batches} scored_authors={total_scored_authors:,} hourly_hard_knee={config.get('derived_thresholds', {}).get('hourly_hard_knee')}",
+                    config=config,
+                )
+            del feature_batch, scored_batch
+            gc.collect()
+
+        if score_writer is not None:
+            score_writer.close()
+            score_writer = None
+        if author_feature_stage_path.exists():
+            author_feature_stage_path.unlink()
+        return pd.read_parquet(author_scores_path)
     finally:
-        if writer is not None:
-            writer.close()
+        if feature_writer is not None:
+            feature_writer.close()
+        if score_writer is not None:
+            score_writer.close()
+        if author_feature_stage_path.exists():
+            author_feature_stage_path.unlink()
         conn.close()
 
 
@@ -1549,12 +1819,15 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
     try:
         if scored_path.exists():
             scored_path.unlink()
+        batch_counter = 0
+        total_scored_rows = 0
+        progress_every = max(int(config["runtime"].get("progress_every_batches", 5)), 1)
         while True:
             query = """
                 SELECT
                     cm.message_id,
-                    cm.original_text,
                     cm.normalized_text,
+                    cm.roberta_score,
                     cm.author_hash,
                     cm.author_type,
                     cm.date,
@@ -1586,6 +1859,7 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
             batch_df = pd.read_sql_query(query, conn, params=[last_id, message_batch_size])
             if batch_df.empty:
                 break
+            batch_counter += 1
             last_id = int(batch_df["message_id"].max())
             batch_df["spam_pattern_flag"] = (
                 (batch_df["same_text_repeat_count"] >= config["thresholds"]["spam_repeat_threshold"])
@@ -1608,10 +1882,16 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
                     + config["weights"]["author_vs_message"]["message"] * final_df["message_score"]
                 ).clip(0, 1),
             )
+            final_df["semantic_score"] = final_df["roberta_score"].fillna(
+                config["semantic_adapter"]["unsupported_language_score"]
+            ).clip(0, 1)
             final_df["final_score"] = np.where(
                 final_df["author_hard_hourly_flag"].eq(1) | final_df["hard_bot_cluster_flag"].eq(1),
                 1.0,
-                final_df["behavioral_score"],
+                (
+                    config["weights"]["behavioral_vs_semantic"]["behavioral"] * final_df["behavioral_score"]
+                    + config["weights"]["behavioral_vs_semantic"]["semantic"] * final_df["semantic_score"]
+                ).clip(0, 1),
             )
 
             heavy_mask = final_df["spam_pattern_flag"].eq(1) | final_df["same_text_repeat_count"].ge(config["thresholds"]["spam_repeat_threshold"])
@@ -1650,12 +1930,21 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
                 "author_score",
                 "message_score",
                 "behavioral_score",
+                "roberta_score",
+                "semantic_score",
                 "final_score",
             ]
             table = pa.Table.from_pandas(final_df[output_columns], preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(scored_path, table.schema, compression="snappy")
             writer.write_table(table)
+            total_scored_rows += len(final_df)
+            if batch_counter == 1 or batch_counter % progress_every == 0:
+                log_progress(
+                    "PASS2_MESSAGE",
+                    f"message_batches={batch_counter} scored_rows={total_scored_rows:,} last_message_id={last_id:,}",
+                    config=config,
+                )
             del batch_df, message_scores, final_df, table
             gc.collect()
 
@@ -1727,6 +2016,18 @@ def build_batch_summary_tables(config: dict[str, Any], pass1_summary: dict[str, 
             conn,
         )
         summary_frame = pd.Series(pass1_summary).to_frame("value")
+        semantic_summary = pd.read_sql_query(
+            """
+            SELECT
+                COUNT(*) AS rows,
+                AVG(roberta_score) AS avg_roberta_score,
+                MIN(roberta_score) AS min_roberta_score,
+                MAX(roberta_score) AS max_roberta_score,
+                SUM(semantic_model_applied_flag) AS semantic_applied_rows
+            FROM cleaned_messages
+            """,
+            conn,
+        )
     finally:
         conn.close()
 
@@ -1753,6 +2054,7 @@ def build_batch_summary_tables(config: dict[str, Any], pass1_summary: dict[str, 
         "hard_bot_examples": message_artifacts["hard_bot_examples"],
         "keyword_validation": message_artifacts["keyword_validation"],
         "score_bands": message_artifacts["score_bands"],
+        "semantic_adapter_summary": semantic_summary,
         "hashtag_spam_examples": message_artifacts["hashtag_spam_examples"],
         "token_spam_examples": message_artifacts["token_spam_examples"],
     }
@@ -1765,7 +2067,10 @@ def build_manifest_summary_table(manifest: dict[str, Any]) -> pd.DataFrame:
             {"field": "pipeline_version", "value": manifest.get("pipeline_version")},
             {"field": "store_schema_version", "value": manifest.get("store_schema_version")},
             {"field": "score_schema_version", "value": manifest.get("score_schema_version")},
+            {"field": "store_schema_fingerprint", "value": manifest.get("store_schema_fingerprint")},
+            {"field": "score_schema_fingerprint", "value": manifest.get("score_schema_fingerprint")},
             {"field": "created_at", "value": manifest.get("created_at")},
+            {"field": "last_rescore_at", "value": manifest.get("last_rescore_at")},
             {"field": "config_hash_for_store", "value": manifest.get("config_hash_for_store")},
             {"field": "config_hash_for_scoring", "value": manifest.get("config_hash_for_scoring")},
             {"field": "hourly_hard_knee", "value": manifest.get("derived_thresholds", {}).get("hourly_hard_knee")},
@@ -1852,12 +2157,17 @@ def compute_message_refs_from_sqlite(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_formula_pipeline_two_pass(config: dict[str, Any]) -> dict[str, Any]:
+    log_progress("PIPELINE", f"full build started build_mode={config['runtime'].get('build_mode', 'lean')}", config=config)
     pass1_summary = run_batch_pass1(config)
     author_scores = run_batch_pass2_author(config)
     refs = compute_message_refs_from_sqlite(config)
     message_artifacts = run_batch_pass2_message(config, refs)
     tables = build_batch_summary_tables(config, pass1_summary, author_scores, message_artifacts)
-    manifest = build_manifest_payload(config)
+    manifest = build_manifest_payload(
+        config,
+        actual_store_columns=list(get_store_columns(config)),
+        actual_score_columns=_parquet_columns(_scored_messages_path_from_config(config)),
+    )
     manifest = write_manifest(_manifest_path_from_config(config), manifest)
     tables["manifest_summary"] = build_manifest_summary_table(manifest)
     return {
@@ -1876,13 +2186,21 @@ def run_formula_pipeline_two_pass(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_rescore_from_existing_store(config: dict[str, Any]) -> dict[str, Any]:
+    log_progress("PIPELINE", "rescore from existing store started", config=config)
     manifest_path = _manifest_path_from_config(config)
     if manifest_path.exists():
         manifest = load_manifest(manifest_path)
         validate_existing_store(config, manifest)
     else:
         validate_existing_store(config, None)
-        manifest = write_manifest(manifest_path, build_manifest_payload(config))
+        manifest = write_manifest(
+            manifest_path,
+            build_manifest_payload(
+                config,
+                actual_store_columns=list(get_store_columns(config)),
+                actual_score_columns=_parquet_columns(_scored_messages_path_from_config(config)) if _scored_messages_path_from_config(config).exists() else None,
+            ),
+        )
 
     author_scores = run_batch_pass2_author(config, refresh_clusters=False)
     refs = compute_message_refs_from_sqlite(config)
@@ -1896,17 +2214,26 @@ def run_rescore_from_existing_store(config: dict[str, Any]) -> dict[str, Any]:
                 "SELECT COUNT(*) FROM cleaned_messages WHERE author_type = 'anonymous' OR author_hash_missing_flag = 1"
             ).fetchone()[0]
         )
+        semantic_applied_rows = int(
+            conn.execute("SELECT COALESCE(SUM(semantic_model_applied_flag), 0) FROM cleaned_messages").fetchone()[0]
+        )
     finally:
         conn.close()
 
     summary = {
         "clean_rows": clean_rows,
         "missing_author_rows": missing_author_rows,
+        "semantic_applied_rows": semantic_applied_rows,
         "technical_duplicates_removed": pd.NA,
         "rescore_only": True,
     }
     tables = build_batch_summary_tables(config, summary, author_scores, message_artifacts)
-    manifest = build_manifest_payload(config, created_at=manifest.get("created_at"))
+    manifest = build_manifest_payload(
+        config,
+        created_at=manifest.get("created_at"),
+        actual_store_columns=list(get_store_columns(config)),
+        actual_score_columns=_parquet_columns(_scored_messages_path_from_config(config)),
+    )
     manifest["last_rescore_at"] = datetime.now(timezone.utc).isoformat()
     manifest = write_manifest(manifest_path, manifest)
     tables["manifest_summary"] = build_manifest_summary_table(manifest)
@@ -1972,9 +2299,12 @@ def score_single_message(
         if clean_single["author_type"].iloc[0] == "identified":
             author_hash = clean_single["author_hash"].iloc[0]
             author_scores = result["author_scores"]
-            author_row = author_scores.loc[author_scores["author_hash"] == author_hash, ["author_hash", "author_score"]]
+            author_row = author_scores.loc[
+                author_scores["author_hash"] == author_hash,
+                ["author_hash", "author_score", "author_hard_hourly_flag"],
+            ]
         else:
-            author_row = pd.DataFrame(columns=["author_hash", "author_score"])
+            author_row = pd.DataFrame(columns=["author_hash", "author_score", "author_hard_hourly_flag"])
         final = compute_final_scores(clean_single, author_row, message_scores, config)
     else:
         conn = get_sqlite_connection(Path(result["paths"]["sqlite_db"]))
@@ -2033,10 +2363,16 @@ def score_single_message(
                 + config["weights"]["author_vs_message"]["message"] * final["message_score"]
             ).clip(0, 1),
         )
+        final["semantic_score"] = final["roberta_score"].fillna(
+            config["semantic_adapter"]["unsupported_language_score"]
+        ).clip(0, 1)
         final["final_score"] = np.where(
             final["author_hard_hourly_flag"].eq(1) | final["hard_bot_cluster_flag"].eq(1),
             1.0,
-            final["behavioral_score"],
+            (
+                config["weights"]["behavioral_vs_semantic"]["behavioral"] * final["behavioral_score"]
+                + config["weights"]["behavioral_vs_semantic"]["semantic"] * final["semantic_score"]
+            ).clip(0, 1),
         )
 
     explanation_columns = [
@@ -2044,6 +2380,8 @@ def score_single_message(
         "message_score",
         "author_score",
         "behavioral_score",
+        "roberta_score",
+        "semantic_score",
         "final_score",
         "same_text_repeat_component",
         "spam_pattern_component",
