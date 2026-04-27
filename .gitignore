@@ -3,3 +3,4 @@ datathonFINAL.parquet
 data
 01_eda.ipynb
 01_eda.ipynb
+__pycache__

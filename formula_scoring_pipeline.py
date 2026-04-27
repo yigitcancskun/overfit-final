@@ -63,7 +63,7 @@ COMMON_MULTI_PART_SUFFIXES = {
 
 PIPELINE_VERSION = "fusion-2026-04-27"
 STORE_SCHEMA_VERSION = "store-v2"
-SCORE_SCHEMA_VERSION = "score-v2"
+SCORE_SCHEMA_VERSION = "score-v5"
 
 REQUIRED_BATCH_TABLES = ("cleaned_messages", "text_clusters", "text_window_clusters")
 REQUIRED_CLEANED_MESSAGE_COLUMNS = (
@@ -110,12 +110,17 @@ REQUIRED_SCORED_MESSAGE_COLUMNS = (
     "max_token_ratio",
     "spam_pattern_flag",
     "hard_bot_cluster_flag",
+    "hard_same_text_repeat_flag",
     "author_hard_hourly_flag",
     "author_score",
     "message_score",
     "behavioral_score",
     "roberta_score",
-    "semantic_score",
+    "behavioral_confidence_weight",
+    "roberta_confidence_weight",
+    "behavioral_effective_weight",
+    "roberta_effective_weight",
+    "final_score_before_rules",
     "final_score",
 )
 
@@ -293,6 +298,7 @@ def extract_text_stats_scalar(value: Any) -> dict[str, float]:
             "max_token_ratio": 0.0,
             "repeated_token_count_over_2": 0.0,
             "hashtag_count": 0.0,
+            "exclamation_count": 0.0,
             "hashtag_density_chars": 0.0,
             "hashtag_density_tokens": 0.0,
         }
@@ -313,6 +319,7 @@ def extract_text_stats_scalar(value: Any) -> dict[str, float]:
         repeated_token_count_over_2 = 0.0
 
     hashtag_count = float(len(HASHTAG_PATTERN.findall(text)))
+    exclamation_count = float(text.count("!"))
     text_len = max(len(text), 1)
     hashtag_density_chars = hashtag_count / text_len
     hashtag_density_tokens = hashtag_count / max(token_count, 1)
@@ -324,6 +331,7 @@ def extract_text_stats_scalar(value: Any) -> dict[str, float]:
         "max_token_ratio": max_token_ratio,
         "repeated_token_count_over_2": repeated_token_count_over_2,
         "hashtag_count": hashtag_count,
+        "exclamation_count": exclamation_count,
         "hashtag_density_chars": hashtag_density_chars,
         "hashtag_density_tokens": hashtag_density_tokens,
     }
@@ -347,7 +355,8 @@ def preprocess_semantic_text_scalar(value: Any) -> str:
 
 
 def detect_torch_device(config: dict[str, Any]) -> str:
-    preferred = config["semantic_adapter"].get("device", "auto")
+    semantic_cfg = resolve_semantic_adapter_config(config)
+    preferred = semantic_cfg.get("device", "auto")
     if preferred != "auto":
         return preferred
     if torch is None:
@@ -358,6 +367,24 @@ def detect_torch_device(config: dict[str, Any]) -> str:
     if mps_backend is not None and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def resolve_semantic_adapter_config(config: dict[str, Any]) -> dict[str, Any]:
+    semantic_cfg = dict(config["semantic_adapter"])
+    model_presets = semantic_cfg.pop("models", None)
+    selected_model_key = semantic_cfg.pop("selected_model_key", None)
+    if not model_presets or not selected_model_key:
+        return semantic_cfg
+    if selected_model_key not in model_presets:
+        available = ", ".join(sorted(model_presets))
+        raise KeyError(
+            f"semantic_adapter.selected_model_key={selected_model_key!r} not found in semantic_adapter.models. "
+            f"Available keys: {available}"
+        )
+    resolved_cfg = dict(semantic_cfg)
+    resolved_cfg.update(model_presets[selected_model_key])
+    resolved_cfg["selected_model_key"] = selected_model_key
+    return resolved_cfg
 
 
 @lru_cache(maxsize=2)
@@ -374,7 +401,7 @@ def _load_semantic_adapter_cached(model_name: str, device: str):
 
 
 def compute_roberta_scores_for_batch(batch_df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
-    semantic_cfg = config["semantic_adapter"]
+    semantic_cfg = resolve_semantic_adapter_config(config)
     neutral_score = float(semantic_cfg["unsupported_language_score"])
     output = pd.DataFrame(
         {
@@ -386,9 +413,22 @@ def compute_roberta_scores_for_batch(batch_df: pd.DataFrame, config: dict[str, A
     if not semantic_cfg.get("enabled", True):
         return output
 
-    supported_languages = {str(lang).lower() for lang in semantic_cfg.get("supported_languages", ["en"])}
-    language_series = batch_df["language"].astype("string").fillna("").str.lower()
-    supported_mask = language_series.isin(supported_languages)
+    selected_model_key = str(semantic_cfg.get("selected_model_key", ""))
+    model_name = str(semantic_cfg["model_name"])
+    if selected_model_key == "xlmr_base_multilingual" and model_name == "FacebookAI/xlm-roberta-base":
+        raise ValueError(
+            "The xlmr_base_multilingual preset points to the raw XLM-R base checkpoint, which is not a bot "
+            "classification model. Set semantic_adapter.models['xlmr_base_multilingual']['model_name'] to a "
+            "fine-tuned XLM-R sequence-classification checkpoint before enabling this preset."
+        )
+
+    supported_languages_value = semantic_cfg.get("supported_languages", ["en"])
+    if supported_languages_value in ("all", "*"):
+        supported_mask = pd.Series(True, index=batch_df.index)
+    else:
+        supported_languages = {str(lang).lower() for lang in supported_languages_value}
+        language_series = batch_df["language"].astype("string").fillna("").str.lower()
+        supported_mask = language_series.isin(supported_languages)
     if not bool(supported_mask.any()):
         return output
 
@@ -398,7 +438,7 @@ def compute_roberta_scores_for_batch(batch_df: pd.DataFrame, config: dict[str, A
         return output
 
     device = detect_torch_device(config)
-    tokenizer, model = _load_semantic_adapter_cached(semantic_cfg["model_name"], device)
+    tokenizer, model = _load_semantic_adapter_cached(model_name, device)
     batch_size = int(semantic_cfg["batch_size"])
     max_length = int(semantic_cfg["max_length"])
     inference_indices = texts.index[non_empty_mask]
@@ -524,6 +564,7 @@ def clean_batch(batch_df: pd.DataFrame, config: dict[str, Any], rare_languages: 
     batch_df["max_token_frequency"] = batch_df["max_token_frequency"].astype("int32")
     batch_df["repeated_token_count_over_2"] = batch_df["repeated_token_count_over_2"].astype("int32")
     batch_df["hashtag_count"] = batch_df["hashtag_count"].astype("int16")
+    batch_df["exclamation_count"] = batch_df["exclamation_count"].astype("int16")
 
     domain_parts = extract_domain_columns(batch_df["url"])
     batch_df = batch_df.drop(columns=["raw_url_domain", "registered_domain", "subdomain"], errors="ignore")
@@ -812,30 +853,29 @@ def log_penalty(series: pd.Series, start_threshold: float, max_reference: float)
     return (np.log1p(excess) / denom).clip(0, 1)
 
 
-def detect_hourly_knee_threshold(values: pd.Series, minimum_floor: int) -> int:
-    clean = pd.to_numeric(values, errors="coerce").dropna()
-    clean = clean[clean > 0].sort_values().reset_index(drop=True)
-    if clean.empty:
-        return minimum_floor
-    if len(clean) == 1:
-        return max(int(clean.iloc[0]), minimum_floor)
+def apply_dominant_signal_floor(
+    base_score: pd.Series,
+    candidate_components: list[pd.Series],
+    config: dict[str, Any],
+    *,
+    scope_key: str,
+) -> pd.Series:
+    policy = config.get("dominant_signal_policy", {})
+    if not bool(policy.get("enabled", False)):
+        return pd.to_numeric(base_score, errors="coerce").fillna(0.0).clip(0, 1)
+    if str(policy.get("mode", "floor")) != "floor":
+        return pd.to_numeric(base_score, errors="coerce").fillna(0.0).clip(0, 1)
+    if not bool(policy.get("scope", {}).get(scope_key, False)):
+        return pd.to_numeric(base_score, errors="coerce").fillna(0.0).clip(0, 1)
+    if not candidate_components:
+        return pd.to_numeric(base_score, errors="coerce").fillna(0.0).clip(0, 1)
 
-    tail = clean[clean >= minimum_floor]
-    if tail.empty:
-        return minimum_floor
-    if len(tail) < 5:
-        return max(int(tail.max()), minimum_floor)
-
-    tail_unique = np.sort(tail.unique())[::-1].astype(float)
-    x = np.linspace(0.0, 1.0, len(tail_unique))
-    y = np.log1p(tail_unique)
-    y = (y - y.min()) / max(y.max() - y.min(), 1e-9)
-    baseline = 1.0 - x
-    distance = y - baseline
-    knee_idx = int(np.argmax(distance))
-    knee_value = int(tail_unique[knee_idx])
-    tail_guard = int(tail.quantile(0.99))
-    return max(knee_value, tail_guard, minimum_floor)
+    threshold = float(policy.get("threshold", 0.68))
+    normalized_base = pd.to_numeric(base_score, errors="coerce").fillna(0.0).clip(0, 1)
+    component_df = pd.concat(candidate_components, axis=1).apply(pd.to_numeric, errors="coerce").fillna(0.0).clip(0, 1)
+    dominant_component = component_df.max(axis=1)
+    dominant_mask = dominant_component.ge(threshold)
+    return normalized_base.where(~dominant_mask, np.maximum(normalized_base, dominant_component)).clip(0, 1)
 
 
 def compute_author_scores(author_features: pd.DataFrame, refs: dict[str, Any], config: dict[str, Any]) -> pd.DataFrame:
@@ -850,9 +890,9 @@ def compute_author_scores(author_features: pd.DataFrame, refs: dict[str, Any], c
 
     scores["activity_posts_per_day_risk"] = bounded_scale(scores["posts_per_day"], *author_refs["posts_per_day"])
     scores["activity_posts_per_hour_risk"] = bounded_scale(scores["posts_per_active_hour"], *author_refs["posts_per_active_hour"])
-    hourly_knee = detect_hourly_knee_threshold(scores["max_posts_one_hour"], thresholds["hourly_penalty_start"])
-    derived_thresholds["hourly_hard_knee"] = int(hourly_knee)
-    scores["author_hard_hourly_flag"] = scores["max_posts_one_hour"].ge(hourly_knee).astype("int8")
+    hourly_hard_threshold = int(thresholds.get("hard_hourly_bot_threshold", 15))
+    derived_thresholds["hourly_hard_knee"] = int(hourly_hard_threshold)
+    scores["author_hard_hourly_flag"] = scores["max_posts_one_hour"].gt(hourly_hard_threshold).astype("int8")
     scores["activity_hourly_penalty_risk"] = log_penalty(
         scores["max_posts_one_hour"],
         thresholds["hourly_penalty_start"],
@@ -903,6 +943,17 @@ def compute_author_scores(author_features: pd.DataFrame, refs: dict[str, Any], c
         + weights["diversity"] * scores["diversity_risk"]
         + weights["metadata"] * scores["metadata_risk"]
     ).clip(0, 1)
+    scores["author_score"] = apply_dominant_signal_floor(
+        scores["author_score"],
+        [
+            scores["activity_risk"],
+            scores["timing_risk"],
+            scores["repetition_risk"],
+            scores["diversity_risk"],
+        ],
+        config,
+        scope_key="author",
+    )
     return scores
 
 
@@ -956,6 +1007,8 @@ def compute_message_scores(message_features: pd.DataFrame, refs: dict[str, Any],
         scores["long_text_component"] = scores["long_text_component"] * scores["spam_pattern_component"]
 
     scores["keyword_signal_component"] = bounded_scale(scores["keyword_count"], *msg_refs["keyword_count"])
+    repeat_hard_threshold = int(config.get("dominant_signal_policy", {}).get("repeat_hard_threshold", 5))
+    scores["hard_same_text_repeat_flag"] = scores["same_text_repeat_count"].gt(repeat_hard_threshold).astype("int8")
     scores["message_score"] = (
         weights["same_text_repeat"] * scores["same_text_repeat_component"]
         + weights["spam_pattern"] * scores["spam_pattern_component"]
@@ -964,7 +1017,167 @@ def compute_message_scores(message_features: pd.DataFrame, refs: dict[str, Any],
         + weights["long_text"] * scores["long_text_component"]
         + weights["keyword_signal"] * scores["keyword_signal_component"]
     ).clip(0, 1)
+    scores["message_score"] = scores["message_score"].where(~scores["hashtag_count"].gt(5), 1.0)
+    scores["message_score"] = scores["message_score"].where(~scores["exclamation_count"].gt(10), 1.0)
+    scores["message_score"] = apply_dominant_signal_floor(
+        scores["message_score"],
+        [
+            scores["same_text_repeat_component"],
+            scores["spam_pattern_component"],
+            scores["hashtag_spam_component"],
+            scores["token_repetition_component"],
+            scores["long_text_component"],
+            scores["keyword_signal_component"],
+        ],
+        config,
+        scope_key="message",
+    )
     return scores
+
+
+def confidence_weight_from_score(score: pd.Series, min_weight: float, power: float) -> pd.Series:
+    score = pd.to_numeric(score, errors="coerce").fillna(0.5).clip(0, 1)
+    distance_from_neutral = (score - 0.5).abs()
+    normalized_distance = (distance_from_neutral / 0.5).clip(0, 1)
+    return (min_weight + (1.0 - min_weight) * np.power(normalized_distance, power)).clip(min_weight, 1.0)
+
+
+def neutral_mask_from_score(score: pd.Series, neutral_score: float, epsilon: float) -> pd.Series:
+    numeric_score = pd.to_numeric(score, errors="coerce").fillna(neutral_score).clip(0, 1)
+    return numeric_score.sub(float(neutral_score)).abs().le(float(epsilon))
+
+
+def apply_neutral_weight_override(
+    left_score: pd.Series,
+    right_score: pd.Series,
+    left_weight: pd.Series,
+    right_weight: pd.Series,
+    neutral_score: float,
+    epsilon: float,
+) -> tuple[pd.Series, pd.Series]:
+    left_neutral_mask = neutral_mask_from_score(left_score, neutral_score, epsilon)
+    right_neutral_mask = neutral_mask_from_score(right_score, neutral_score, epsilon)
+
+    left_adjusted = left_weight.where(~left_neutral_mask, 0.0)
+    right_adjusted = right_weight.where(~right_neutral_mask, 0.0)
+    total_adjusted = left_adjusted + right_adjusted
+    both_neutral_mask = left_neutral_mask & right_neutral_mask
+
+    safe_total = total_adjusted.where(total_adjusted.gt(0), 1.0)
+    left_final = (left_adjusted / safe_total).where(total_adjusted.gt(0), 0.5)
+    right_final = (right_adjusted / safe_total).where(total_adjusted.gt(0), 0.5)
+    left_final = left_final.where(~both_neutral_mask, 0.5)
+    right_final = right_final.where(~both_neutral_mask, 0.5)
+    return left_final.astype("float32"), right_final.astype("float32")
+
+
+def sigmoid_gate_weights(left: pd.Series, right: pd.Series, steepness: float) -> tuple[pd.Series, pd.Series]:
+    steepness = max(float(steepness), 1e-6)
+    left_values = pd.to_numeric(left, errors="coerce").fillna(0.0)
+    right_values = pd.to_numeric(right, errors="coerce").fillna(0.0)
+    logits = np.clip(steepness * (right_values - left_values), -60, 60)
+    right_weight = 1.0 / (1.0 + np.exp(-logits))
+    left_weight = 1.0 - right_weight
+    return left_weight, right_weight
+
+
+def apply_final_score_weighting(df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    weights = config["weights"]["behavioral_vs_semantic"]
+    behavioral_prior = float(weights["behavioral"])
+    roberta_prior = float(weights["semantic"])
+    dynamic_cfg = config.get("dynamic_final_weighting", {})
+    dynamic_enabled = bool(dynamic_cfg.get("enabled", False))
+    semantic_cfg = resolve_semantic_adapter_config(config)
+    neutral_policy_cfg = config.get("neutral_score_policy", {})
+    neutral_score = float(neutral_policy_cfg.get("neutral_score", semantic_cfg["unsupported_language_score"]))
+    neutral_epsilon = float(neutral_policy_cfg.get("epsilon", 1e-6))
+
+    df["roberta_score"] = df["roberta_score"].fillna(neutral_score).clip(0, 1)
+    behavioral_input_score = df["behavioral_score"].copy()
+
+    if dynamic_enabled:
+        min_weight = float(dynamic_cfg.get("min_confidence_weight", 0.2))
+        power = float(dynamic_cfg.get("power", 2.0))
+        df["behavioral_confidence_weight"] = confidence_weight_from_score(behavioral_input_score, min_weight, power)
+        df["roberta_confidence_weight"] = confidence_weight_from_score(df["roberta_score"], min_weight, power)
+    else:
+        df["behavioral_confidence_weight"] = 1.0
+        df["roberta_confidence_weight"] = 1.0
+
+    behavioral_raw_weight = behavioral_prior * df["behavioral_confidence_weight"]
+    roberta_raw_weight = roberta_prior * df["roberta_confidence_weight"]
+    if dynamic_enabled:
+        sigmoid_steepness = float(dynamic_cfg.get("sigmoid_steepness", 8.0))
+        df["behavioral_effective_weight"], df["roberta_effective_weight"] = sigmoid_gate_weights(
+            behavioral_raw_weight,
+            roberta_raw_weight,
+            sigmoid_steepness,
+        )
+    else:
+        total_prior = max(behavioral_prior + roberta_prior, 1e-6)
+        df["behavioral_effective_weight"] = behavioral_prior / total_prior
+        df["roberta_effective_weight"] = roberta_prior / total_prior
+    df["behavioral_effective_weight"], df["roberta_effective_weight"] = apply_neutral_weight_override(
+        behavioral_input_score,
+        df["roberta_score"],
+        df["behavioral_effective_weight"],
+        df["roberta_effective_weight"],
+        neutral_score,
+        neutral_epsilon,
+    )
+    df["final_score_before_rules"] = (
+        df["behavioral_effective_weight"] * behavioral_input_score
+        + df["roberta_effective_weight"] * df["roberta_score"]
+    ).clip(0, 1)
+    df["final_score"] = np.where(
+        df["author_hard_hourly_flag"].fillna(0).eq(1)
+        | df["hard_bot_cluster_flag"].fillna(0).eq(1)
+        | df["hard_same_text_repeat_flag"].fillna(0).eq(1),
+        1.0,
+        df["final_score_before_rules"],
+    )
+    df["final_score"] = df["final_score"].where(~df["hashtag_count"].fillna(0).gt(5), 1.0)
+    df["final_score"] = df["final_score"].where(~df["exclamation_count"].fillna(0).gt(10), 1.0)
+    return df
+
+
+def compute_behavioral_score(df: pd.DataFrame, config: dict[str, Any]) -> pd.Series:
+    author_weight = config["weights"]["author_vs_message"]["author"]
+    message_weight = config["weights"]["author_vs_message"]["message"]
+    neutral_policy_cfg = config.get("neutral_score_policy", {})
+    neutral_score = float(neutral_policy_cfg.get("neutral_score", 0.5))
+    neutral_epsilon = float(neutral_policy_cfg.get("epsilon", 1e-6))
+    author_input_score = pd.to_numeric(df["author_score"], errors="coerce").fillna(neutral_score).clip(0, 1)
+    message_input_score = pd.to_numeric(df["message_score"], errors="coerce").fillna(neutral_score).clip(0, 1)
+    author_weights = pd.Series(float(author_weight), index=df.index, dtype="float32")
+    message_weights = pd.Series(float(message_weight), index=df.index, dtype="float32")
+    behavioral_author_weight, behavioral_message_weight = apply_neutral_weight_override(
+        author_input_score,
+        message_input_score,
+        author_weights,
+        message_weights,
+        neutral_score,
+        neutral_epsilon,
+    )
+    behavioral_score = (
+        behavioral_author_weight * author_input_score + behavioral_message_weight * message_input_score
+    ).clip(0, 1)
+    dominant_policy = config.get("dominant_signal_policy", {})
+    dominant_threshold = float(dominant_policy.get("threshold", 0.68))
+    dominant_message_mask = message_input_score.ge(dominant_threshold)
+    if bool(dominant_message_mask.any()):
+        behavioral_score = behavioral_score.where(
+            ~dominant_message_mask,
+            np.maximum(behavioral_score, message_input_score),
+        )
+    anonymous_mask = df["author_type"].eq("anonymous")
+    if bool(anonymous_mask.any()):
+        behavioral_score = behavioral_score.where(~anonymous_mask, message_input_score)
+    if "hard_same_text_repeat_flag" in df.columns:
+        hard_repeat_mask = df["hard_same_text_repeat_flag"].fillna(0).eq(1)
+        if bool(hard_repeat_mask.any()):
+            behavioral_score = behavioral_score.where(~hard_repeat_mask, 1.0)
+    return behavioral_score
 
 
 def compute_final_scores(
@@ -981,23 +1194,8 @@ def compute_final_scores(
         df["author_score"] = np.nan
         df["author_hard_hourly_flag"] = 0
 
-    author_weight = config["weights"]["author_vs_message"]["author"]
-    message_weight = config["weights"]["author_vs_message"]["message"]
-    df["behavioral_score"] = np.where(
-        df["author_type"].eq("anonymous"),
-        df["message_score"],
-        (author_weight * df["author_score"].fillna(0.0) + message_weight * df["message_score"]).clip(0, 1),
-    )
-    df["semantic_score"] = df["roberta_score"].fillna(config["semantic_adapter"]["unsupported_language_score"]).clip(0, 1)
-    df["final_score"] = np.where(
-        df["author_hard_hourly_flag"].fillna(0).eq(1) | df["hard_bot_cluster_flag"].eq(1),
-        1.0,
-        (
-            config["weights"]["behavioral_vs_semantic"]["behavioral"] * df["behavioral_score"]
-            + config["weights"]["behavioral_vs_semantic"]["semantic"] * df["semantic_score"]
-        ).clip(0, 1),
-    )
-    return df
+    df["behavioral_score"] = compute_behavioral_score(df, config)
+    return apply_final_score_weighting(df, config)
 
 
 def run_formula_pipeline(config: dict[str, Any]) -> dict[str, Any]:
@@ -1042,14 +1240,18 @@ def build_qa_tables(result: dict[str, Any], config: dict[str, Any]) -> dict[str,
         "language_diversity_authors": author_scores.loc[author_scores["language_nunique"] > config["thresholds"]["language_penalty_start"]]
         .sort_values("language_nunique", ascending=False)
         .head(50),
-        "hard_bot_examples": scored_df.loc[scored_df["hard_bot_cluster_flag"] == 1, [
+        "hard_bot_examples": scored_df.loc[
+            scored_df["hard_bot_cluster_flag"].eq(1) | scored_df["hard_same_text_repeat_flag"].eq(1),
+            [
             "author_hash",
             "normalized_text",
             "same_text_repeat_count",
             "same_text_unique_author_count",
             "same_text_time_window_count",
+            "hard_same_text_repeat_flag",
             "final_score",
-        ]].head(50),
+        ],
+        ].head(50),
         "rapid_fire_examples": author_scores.sort_values("median_interpost_sec", ascending=True).head(50),
     }
     return tables
@@ -1217,6 +1419,7 @@ def _extract_scoring_config(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "thresholds": {
             "hourly_penalty_start": config["thresholds"]["hourly_penalty_start"],
+            "hard_hourly_bot_threshold": config["thresholds"].get("hard_hourly_bot_threshold", 15),
             "language_penalty_start": config["thresholds"]["language_penalty_start"],
             "hard_bot_repeat_threshold": config["thresholds"]["hard_bot_repeat_threshold"],
             "hard_bot_multi_author_threshold": config["thresholds"]["hard_bot_multi_author_threshold"],
@@ -1226,6 +1429,8 @@ def _extract_scoring_config(config: dict[str, Any]) -> dict[str, Any]:
             "spam_time_cluster_threshold": config["thresholds"]["spam_time_cluster_threshold"],
         },
         "rules": config.get("rules", {}),
+        "neutral_score_policy": config.get("neutral_score_policy", {}),
+        "dominant_signal_policy": config.get("dominant_signal_policy", {}),
         "weights": config["weights"],
         "versions": {
             "score_schema_version": SCORE_SCHEMA_VERSION,
@@ -1839,6 +2044,7 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
                     cm.max_token_ratio,
                     cm.repeated_token_count_over_2,
                     cm.hashtag_count,
+                    (LENGTH(cm.normalized_text) - LENGTH(REPLACE(cm.normalized_text, '!', ''))) AS exclamation_count,
                     cm.hashtag_density_chars,
                     cm.hashtag_density_tokens,
                     cm.is_long_text_flag,
@@ -1874,25 +2080,8 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
 
             message_scores = compute_message_scores(batch_df, refs, config)
             final_df = message_scores.copy()
-            final_df["behavioral_score"] = np.where(
-                final_df["author_type"].eq("anonymous"),
-                final_df["message_score"],
-                (
-                    config["weights"]["author_vs_message"]["author"] * final_df["author_score"].fillna(0.0)
-                    + config["weights"]["author_vs_message"]["message"] * final_df["message_score"]
-                ).clip(0, 1),
-            )
-            final_df["semantic_score"] = final_df["roberta_score"].fillna(
-                config["semantic_adapter"]["unsupported_language_score"]
-            ).clip(0, 1)
-            final_df["final_score"] = np.where(
-                final_df["author_hard_hourly_flag"].eq(1) | final_df["hard_bot_cluster_flag"].eq(1),
-                1.0,
-                (
-                    config["weights"]["behavioral_vs_semantic"]["behavioral"] * final_df["behavioral_score"]
-                    + config["weights"]["behavioral_vs_semantic"]["semantic"] * final_df["semantic_score"]
-                ).clip(0, 1),
-            )
+            final_df["behavioral_score"] = compute_behavioral_score(final_df, config)
+            final_df = apply_final_score_weighting(final_df, config)
 
             heavy_mask = final_df["spam_pattern_flag"].eq(1) | final_df["same_text_repeat_count"].ge(config["thresholds"]["spam_repeat_threshold"])
             heavy_keyword_stats["heavy_keyword_sum"] += float(final_df.loc[heavy_mask, "keyword_count"].sum())
@@ -1902,7 +2091,9 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
 
             if not preview_frames:
                 preview_frames.append(final_df.head(20).copy())
-            hard_bot_sample = final_df.loc[final_df["hard_bot_cluster_flag"].eq(1)].head(50)
+            hard_bot_sample = final_df.loc[
+                final_df["hard_bot_cluster_flag"].eq(1) | final_df["hard_same_text_repeat_flag"].eq(1)
+            ].head(50)
             if not hard_bot_sample.empty and len(hard_bot_examples) < 3:
                 hard_bot_examples.append(hard_bot_sample.copy())
             hashtag_sample = final_df.sort_values("hashtag_spam_component", ascending=False).head(20)
@@ -1922,16 +2113,22 @@ def run_batch_pass2_message(config: dict[str, Any], refs: dict[str, Any]) -> dic
                 "same_text_unique_author_count",
                 "same_text_time_window_count",
                 "hashtag_count",
+                "exclamation_count",
                 "max_token_frequency",
                 "max_token_ratio",
                 "spam_pattern_flag",
                 "hard_bot_cluster_flag",
+                "hard_same_text_repeat_flag",
                 "author_hard_hourly_flag",
                 "author_score",
                 "message_score",
                 "behavioral_score",
                 "roberta_score",
-                "semantic_score",
+                "behavioral_confidence_weight",
+                "roberta_confidence_weight",
+                "behavioral_effective_weight",
+                "roberta_effective_weight",
+                "final_score_before_rules",
                 "final_score",
             ]
             table = pa.Table.from_pandas(final_df[output_columns], preserve_index=False)
@@ -2355,25 +2552,8 @@ def score_single_message(
         refs = compute_message_refs_from_sqlite(config)
         message_scores = compute_message_scores(clean_single, refs, config)
         final = message_scores.copy()
-        final["behavioral_score"] = np.where(
-            final["author_type"].eq("anonymous"),
-            final["message_score"],
-            (
-                config["weights"]["author_vs_message"]["author"] * final["author_score"].fillna(0.0)
-                + config["weights"]["author_vs_message"]["message"] * final["message_score"]
-            ).clip(0, 1),
-        )
-        final["semantic_score"] = final["roberta_score"].fillna(
-            config["semantic_adapter"]["unsupported_language_score"]
-        ).clip(0, 1)
-        final["final_score"] = np.where(
-            final["author_hard_hourly_flag"].eq(1) | final["hard_bot_cluster_flag"].eq(1),
-            1.0,
-            (
-                config["weights"]["behavioral_vs_semantic"]["behavioral"] * final["behavioral_score"]
-                + config["weights"]["behavioral_vs_semantic"]["semantic"] * final["semantic_score"]
-            ).clip(0, 1),
-        )
+        final["behavioral_score"] = compute_behavioral_score(final, config)
+        final = apply_final_score_weighting(final, config)
 
     explanation_columns = [
         "author_type",
@@ -2381,7 +2561,11 @@ def score_single_message(
         "author_score",
         "behavioral_score",
         "roberta_score",
-        "semantic_score",
+        "behavioral_confidence_weight",
+        "roberta_confidence_weight",
+        "behavioral_effective_weight",
+        "roberta_effective_weight",
+        "final_score_before_rules",
         "final_score",
         "same_text_repeat_component",
         "spam_pattern_component",
@@ -2391,5 +2575,6 @@ def score_single_message(
         "keyword_signal_component",
         "author_hard_hourly_flag",
         "hard_bot_cluster_flag",
+        "hard_same_text_repeat_flag",
     ]
     return final[explanation_columns]
