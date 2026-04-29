@@ -1,5 +1,7 @@
 # Fusion Risk Scoring Model
 
+![Fusion logo](fusionlogo.svg)
+
 Fusion, sosyal medya içeriklerinde manipülatife yakın davranış paternlerini bulmak için yazılmış açıklanabilir bir risk skorlama modelidir.
 
 Bu proje klasik supervised bot classifier değildir. Veri setinde `bot`, `human`, `manipulative`, `organic` gibi hedef etiket yoktur. Bu nedenle model, etiket öğrenmek yerine davranışsal ve semantik sinyallerden `0-1` arası risk skoru üretir.
@@ -601,4 +603,3 @@ Bu skorlar kesin bot etiketi değildir. Skor, manipulasyon riski ve organiklikte
 - Yüksek frekans her zaman bot demek değildir.
 - Aynı metin tekrari kampanya, haber yayılımı veya spam olabilir.
 - Final yorumda tablo ve örnekler birlikte incelenmelidir.
-
