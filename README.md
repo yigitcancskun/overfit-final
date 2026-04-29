@@ -602,12 +602,3 @@ Bu skorlar kesin bot etiketi değildir. Skor, manipulasyon riski ve organiklikte
 - Aynı metin tekrari kampanya, haber yayılımı veya spam olabilir.
 - Final yorumda tablo ve örnekler birlikte incelenmelidir.
 
-## Önerilen Sunum Anlatımı
-
-1. Veri setinde etiket yok.
-2. Bu nedenle supervised classifier yerine açıklanabilir risk motoru kuruldu.
-3. Fusion modeli davranışsal ve semantik sinyalleri ayrı hesaplar.
-4. Author ve message seviyesinde normalize skorlar üretilir.
-5. RoBERTa sadece desteklenen dillerde semantik destek sağlar.
-6. Hard rule mekanizması aşırı koordinasyon sinyallerini doğrudan yüksek risk sayar.
-7. Sistem hem toplu skor dosyalari hem de tek mesaj inference çıktısi üretir.
