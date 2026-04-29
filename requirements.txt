@@ -11,3 +11,4 @@ psutil
 transformers
 torch
 safetensors
+pytest

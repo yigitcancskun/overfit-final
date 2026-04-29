@@ -182,6 +182,48 @@ Sebep:
 
 Fusion bu iki katmanı birleştirir.
 
+## Kod Yapısı
+
+Public repo görünümü için çalışma kodu artık katmanlara ayrılmıştır:
+
+```text
+main.py
+fusion_pipeline/
+  config.py
+  constants.py
+  data_processing.py
+  scoring.py
+  artifacts.py
+  inference.py
+  pipeline.py
+  legacy_impl.py
+formula_scoring_pipeline.py
+```
+
+Rol dağılımı:
+
+- `main.py`: tek giriş noktası
+- `fusion_pipeline/config.py`: varsayılan config ve JSON override yükleme
+- `fusion_pipeline/constants.py`: shared schema, version, and store constants
+- `fusion_pipeline/data_processing.py`: veri temizleme, feature extraction, semantic preprocess
+- `fusion_pipeline/scoring.py`: formula, weighting, final score mantığı
+- `fusion_pipeline/artifacts.py`: SQLite store, manifest, QA tabloları, artefact validation
+- `fusion_pipeline/inference.py`: tek mesaj inference
+- `fusion_pipeline/pipeline.py`: build ve rescore orchestration
+- `fusion_pipeline/legacy_impl.py`: compatibility layer for older imports
+- `formula_scoring_pipeline.py`: eski notebook importları için compatibility shim
+
+Aktif public path:
+
+- `main.py`
+- `fusion_pipeline/`
+- `config.sample.json`
+- `fusion.ipynb`
+
+Arşivlenmiş eski deneyler:
+
+- `archive/`
+
 ## Ana Dosyalar
 
 ```text
@@ -191,10 +233,16 @@ fusion.ipynb
 Ana notebook. Config, model test, full build, rescore, QA tablolar, grafikler ve tek mesaj inference akışi buradadır.
 
 ```text
+main.py
+```
+
+Notebook dışı çalıştırma için CLI entrypoint.
+
+```text
 formula_scoring_pipeline.py
 ```
 
-Temizleme, feature engineering, RoBERTa inference, SQLite store, author scoring, message scoring ve final scoring fonksiyonlarını içerir.
+Geriye dönük uyumluluk katmanı. Asıl kod `fusion_pipeline/` altına taşınmıştır.
 
 ```text
 formulas.md
@@ -207,6 +255,28 @@ data/datathonFINAL.parquet
 ```
 
 Ana veri dosyası.
+
+## Package-First Kullanım
+
+Config template üret:
+
+```bash
+python main.py --mode write-config --output-config config.sample.json
+```
+
+Var olan artefact'ları doğrula:
+
+```bash
+python main.py --mode validate --config config.sample.json
+```
+
+Tek mesaj skorla:
+
+```bash
+python main.py --mode score-single --config config.sample.json --message "sample message"
+```
+
+Notebook isteyen akış için `fusion.ipynb` korunur. Public repo içinde desteklenen CLI yolu `main.py` üzerindendir.
 
 ## Çalışma Modları
 
@@ -428,6 +498,12 @@ Weight değişikliği sonrası:
 1. `use_model_test_sample = False`
 2. `Rescore From Existing Store` çalıştır
 3. `Artefact Readiness Check` çalıştır
+
+CLI karşılıkları:
+
+1. Full build: `python main.py --mode build --config config.sample.json`
+2. Rescore: `python main.py --mode rescore --config config.sample.json`
+3. Validate: `python main.py --mode validate --config config.sample.json`
 
 ## Çıktılar
 
