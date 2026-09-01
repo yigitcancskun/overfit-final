@@ -1,0 +1,98 @@
+{
+  "paths": {
+    "input_parquet": "data/datathonFINAL.parquet",
+    "clean_output_parquet": "data/datathonFINAL_formula_cleaned.parquet",
+    "batch_sqlite_db": "data/fusion_batch_store.sqlite",
+    "author_scores_parquet": "data/fusion_author_scores.parquet",
+    "scored_messages_parquet": "data/fusion_scored_messages.parquet",
+    "manifest_path": "data/fusion_manifest.json",
+    "author_feature_stage_parquet": "data/fusion_author_feature_stage.parquet"
+  },
+  "runtime": {
+    "mode": "full",
+    "build_mode": "lean",
+    "batch_size": 50000,
+    "max_batches": null,
+    "sample_n_rows": null,
+    "overwrite_outputs": true,
+    "enable_progress_logs": true,
+    "progress_every_batches": 5,
+    "top_n_domain_context": 128,
+    "author_batch_size": 5000,
+    "message_batch_size": 100000
+  },
+  "semantic_adapter": {
+    "enabled": true,
+    "model_name": "junaid1993/distilroberta-bot-detection",
+    "supported_languages": [
+      "en"
+    ],
+    "unsupported_language_score": 0.5,
+    "max_length": 512,
+    "batch_size": 32,
+    "device": "auto"
+  },
+  "thresholds": {
+    "min_text_len": 5,
+    "rare_language_threshold": 100,
+    "long_text_start": 30,
+    "hourly_penalty_start": 10,
+    "language_penalty_start": 4,
+    "hard_bot_time_window_sec": 300,
+    "hard_bot_repeat_threshold": 5,
+    "hard_bot_multi_author_threshold": 2,
+    "hard_bot_time_cluster_threshold": 3,
+    "spam_repeat_threshold": 3,
+    "spam_multi_author_threshold": 2,
+    "spam_time_cluster_threshold": 3
+  },
+  "rules": {
+    "long_text_requires_spam": false
+  },
+  "dynamic_final_weighting": {
+    "enabled": true,
+    "min_confidence_weight": 0.2,
+    "power": 2.0,
+    "sigmoid_steepness": 8.0
+  },
+  "neutral_score_policy": {
+    "neutral_score": 0.5,
+    "epsilon": 1e-06
+  },
+  "dominant_signal_policy": {
+    "enabled": true,
+    "mode": "floor",
+    "threshold": 0.68,
+    "repeat_hard_threshold": 5,
+    "scope": {
+      "author": true,
+      "message": true
+    }
+  },
+  "derived_thresholds": {},
+  "weights": {
+    "behavioral_vs_semantic": {
+      "behavioral": 0.6,
+      "semantic": 0.4
+    },
+    "author_vs_message": {
+      "author": 0.7,
+      "message": 0.3
+    },
+    "author_components": {
+      "activity": 0.35,
+      "timing": 0.25,
+      "repetition": 0.3,
+      "diversity": 0.1,
+      "metadata": 0.0
+    },
+    "message_components": {
+      "same_text_repeat": 0.24,
+      "spam_pattern": 0.25,
+      "hashtag_spam": 0.18,
+      "token_repetition": 0.15,
+      "long_text": 0.1,
+      "keyword_signal": 0.08
+    }
+  }
+}
