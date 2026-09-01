@@ -5,6 +5,24 @@ description = "Açıklanabilir sosyal medya manipülasyon-risk skorlama hattı."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+authors = [
+  { name = "Yiğitcan Coşkun" },
+  { name = "Sena Yılmaz" },
+  { name = "Çağrı Okan" },
+  { name = "Süleyman Uzun" },
+]
+keywords = [
+  "risk-scoring",
+  "explainable-ai",
+  "transformers",
+  "datathon",
+  "nlp",
+]
+
+[project.urls]
+Homepage = "https://github.com/yigitcancskun/fusion"
+Repository = "https://github.com/yigitcancskun/fusion"
+Issues = "https://github.com/yigitcancskun/fusion/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

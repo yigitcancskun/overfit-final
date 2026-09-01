@@ -1,11 +1,11 @@
 # Fusion
 
 <p align="left">
+  <a href="https://github.com/yigitcancskun/fusion"><img src="https://img.shields.io/badge/GitHub-yigitcancskun%2Ffusion-181717?style=flat-square&logo=github" alt="GitHub" /></a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python" />
   <img src="https://img.shields.io/badge/PyTorch-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch" />
   <img src="https://img.shields.io/badge/Transformers-FFD21E?style=flat-square&logo=huggingface&logoColor=black" alt="Transformers" />
-  <img src="https://img.shields.io/badge/Pandas-150458?style=flat-square&logo=pandas&logoColor=white" alt="Pandas" />
-  <img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License" />
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/yigitcancskun/fusion?style=flat-square" alt="License" /></a>
 </p>
 
 <p align="center">
@@ -17,6 +17,14 @@ Sosyal medya içeriklerinde **manipülasyona yakın davranış örüntülerini**
 Bu bir denetimli bot sınıflandırıcı değildir. Veride `bot`, `human`, `manipulative`, `organic` etiketleri yok. Fusion etiket ezberlemez; davranış ve semantik sinyallerden `0–1` arası bir risk skoru üretir.
 
 *Inter-University Datathon — ulusal 3. sıra.*
+
+| | |
+| :--- | :--- |
+| Depo | [github.com/yigitcancskun/fusion](https://github.com/yigitcancskun/fusion) |
+| Lisans | [MIT](LICENSE) |
+| Dil | Python 3.10+ |
+| Atıf | [CITATION.cff](CITATION.cff) |
+| Konular | `python` · `pytorch` · `transformers` · `datathon` · `risk-scoring` · `explainable-ai` |
 
 ---
 

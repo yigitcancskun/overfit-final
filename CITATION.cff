@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+title: Fusion
+message: Bu yazılımı kullanıyorsanız aşağıdaki atfı kullanın.
+type: software
+license: MIT
+repository-code: "https://github.com/yigitcancskun/fusion"
+url: "https://github.com/yigitcancskun/fusion"
+abstract: >-
+  Açıklanabilir sosyal medya manipülasyon-risk skorlama modeli.
+  Davranış sinyalleri ile DistilRoBERTa semantik katmanını birleştirir.
+  Inter-University Datathon ulusal 3. sıra.
+keywords:
+  - risk-scoring
+  - explainable-ai
+  - transformers
+  - social-media
+  - datathon
+authors:
+  - family-names: Coşkun
+    given-names: Yiğitcan
+  - family-names: Yılmaz
+    given-names: Sena
+  - family-names: Okan
+    given-names: Çağrı
+  - family-names: Uzun
+    given-names: Süleyman
+year: 2026
+version: "1.0.0"
